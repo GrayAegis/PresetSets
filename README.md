@@ -115,7 +115,8 @@ instead, and you get `Modern + [Wren]`. If no set applies, the modifier goes on 
 preset's own toggles. Links to sets or modifiers that no longer exist are skipped.
 
 Link from the bar: choose a set or modifier and press 🔗. Or use the selects in the Extensions
-panel. Applying a set by hand with ✓ applies just that set, without the persona's modifier.
+panel. Applying a set by hand with ✓ applies just that set, without the persona's modifier, and lasts
+until the next automatic apply: a persona or chat change, a preset switch, or the next message.
 
 With **Apply the linked set automatically** on, the linked set and modifier are applied when you
 change persona, open a chat, switch preset, and again just before each generation.

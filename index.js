@@ -10,7 +10,7 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import {
     allDependants, applyChanges, changesBetween, checkAll, directDependants, excludes, inherited,
-    normaliseSet, possibleBases, readMarkers, removeKeeping, renameReferences, resolve,
+    normaliseReference, normaliseSet, possibleBases, readMarkers, removeKeeping, renameReferences, resolve,
 } from './layers.js';
 
 const MODULE_NAME = 'presetSets';
@@ -26,7 +26,8 @@ const defaultSettings = {
     /**
      * Per Chat Completion preset name:
      * { sets: { [name]: Set }, defaultSet, locked, known: string[], markers: { groups, withIds } }
-     * A Set is { kind: 'set'|'modifier', base, modifiers, on, off, updated } (see layers.js).
+     * A Set is { kind: 'set'|'modifier', base, modifiers, on, off, updated }, and a modifier may
+     * also have context: { base, modifiers }, what it was made against (see layers.js).
      * `known` is every prompt seen so far, so new prompts can be offered to sets.
      * `markers` caches which prompts exclude each other, read from the prompt text.
      */
@@ -40,6 +41,9 @@ const defaultSettings = {
 };
 
 const EMPTY_RULES = Object.freeze({ groupOf: new Map(), withIds: new Map() });
+
+/** How long an apply waits for SillyTavern to save the toggles before carrying on. */
+const SAVE_WAIT_MS = 2500;
 
 /** Notices already shown this session, so a stale set doesn't warn on every message. */
 const warnedMissing = new Set();
@@ -213,9 +217,6 @@ function planApply(ids, rows = readRows()) {
     };
 }
 
-/** True while this extension is switching prompts itself, so the lock lets those changes through. */
-let applying = false;
-
 /**
  * Switch prompts on and off to match a list. Prompts not listed are switched off.
  * Only the live toggles change; the preset file on disk is not touched.
@@ -229,12 +230,15 @@ async function applyIds(ids) {
     }
 
     if (before.changes.length) {
-        applying = true;
-
+        // SillyTavern's save only resolves once the settings save succeeds, and never if it fails.
+        // The toggles are already live in memory, so wait a little for it, never indefinitely.
         try {
-            await pm.saveServiceSettings?.();
-        } finally {
-            applying = false;
+            await Promise.race([
+                Promise.resolve(pm.saveServiceSettings?.()),
+                new Promise(resolve => setTimeout(resolve, SAVE_WAIT_MS)),
+            ]);
+        } catch (error) {
+            console.warn(LOG, 'Saving the prompt toggles failed', error);
         }
 
         // NemoPresetExt can keep the text of switched-off prompts out of memory. Its own save
@@ -301,10 +305,6 @@ function rulesFor(data = presetData()) {
 }
 
 /**
- * Read the exclusivity markers from every prompt's text. NemoPresetExt can keep switched-off
- * prompts' text out of memory, so the text is read through it when it is installed.
- */
-/**
  * Read prompts' text. NemoPresetExt can keep switched-off prompts' text out of memory, so the text
  * is read through it when it is installed.
  */
@@ -328,10 +328,24 @@ async function readPromptTexts(prompts = promptManager.serviceSettings.prompts) 
     return new Map(found);
 }
 
-/** The exclusivity markers in a set of prompt texts, in prompt order. */
-function markersFrom(texts) {
+/**
+ * The exclusivity markers in a set of prompt texts, in prompt order. `@exclusive-with` may name
+ * prompts by id or by name, as NemoPresetExt allows; both are turned into ids here.
+ */
+function markersFrom(texts, prompts = promptManager?.serviceSettings?.prompts || []) {
     const groups = {};
     const withIds = {};
+    const byReference = new Map();
+
+    for (const prompt of prompts) {
+        byReference.set(normaliseReference(prompt.identifier), prompt.identifier);
+
+        if (prompt.name && !byReference.has(normaliseReference(prompt.name))) {
+            byReference.set(normaliseReference(prompt.name), prompt.identifier);
+        }
+    }
+
+    const toId = (reference) => (texts.has(reference) ? reference : byReference.get(normaliseReference(reference)) ?? reference);
 
     for (const [id, text] of texts) {
         const marks = readMarkers(text);
@@ -341,7 +355,7 @@ function markersFrom(texts) {
         }
 
         if (marks.withIds.length) {
-            withIds[id] = marks.withIds;
+            withIds[id] = [...new Set(marks.withIds.map(toId))].filter(other => other !== id);
         }
     }
 
@@ -381,7 +395,7 @@ async function refreshRules() {
  */
 function describePrompt(text) {
     const source = String(text || '');
-    const tooltip = source.match(/\{\{\/\/\s*@tooltip\s+([\s\S]*?)\s*\}\}/)?.[1];
+    const tooltip = readMarkers(source).tooltip;
 
     if (tooltip) {
         return tooltip.replace(/^(\s*\[[^\]]*\]\s*)+/, '').trim();
@@ -425,7 +439,7 @@ function ensureKnown(data) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Links: persona, character card, persona with card
+// Links: persona set, card set, persona modifier
 // ---------------------------------------------------------------------------------------------
 
 /** The open character card, or group chat, as a stable key and a display name. */
@@ -725,16 +739,28 @@ function reportApply(label, result, automatic) {
     }
 }
 
-/** Apply a target ({ name, modifier, source }) and remember it as the one in use. */
+/**
+ * Apply a target ({ name, modifier, source }) and remember it as the one in use. It is recorded
+ * before the toggles change, so a locked preset holds them to this target throughout, including
+ * hand toggles made while the save is in progress.
+ */
 async function applyTarget(target, automatic) {
     const ids = targetIds(target);
+    const preset = currentPresetName();
 
     if (!ids) {
         return null;
     }
 
+    lastApplied = { preset, name: target.name, modifier: target.modifier || null, source: target.source, missing: [] };
     const result = await applyIds(ids);
-    lastApplied = { preset: currentPresetName(), name: target.name, modifier: target.modifier || null, source: target.source, ...result };
+
+    // The preset was switched while saving: the result belongs to the old one, so don't report it.
+    if (currentPresetName() !== preset) {
+        return null;
+    }
+
+    Object.assign(lastApplied, result);
     reportApply(`"${targetLabel(target)}"`, result, automatic);
     return result;
 }
@@ -809,7 +835,10 @@ async function reapplyInUse() {
         return;
     }
 
-    const target = keptTarget() ?? (getSettings().autoApply ? targetFor() : null);
+    // With automatic applying on, what's linked now wins (a set applied by hand lasts only until
+    // the next automatic apply anyway); otherwise keep what was applied last.
+    const linked = getSettings().autoApply ? targetFor() : null;
+    const target = linked?.name || linked?.modifier ? linked : keptTarget();
 
     if (target?.name || target?.modifier) {
         await serial(() => applyTarget(target, true));
@@ -898,7 +927,7 @@ function installLockHook() {
     pm.saveServiceSettings = async function (...args) {
         let reverted = 0;
 
-        if (!applying && isReady() && isLocked()) {
+        if (isReady() && isLocked()) {
             const ids = enforcedIds();
 
             if (ids) {
@@ -1046,9 +1075,10 @@ async function updateSelected(name) {
         return;
     }
 
-    const confirmed = await callGenericPopup(`Make "${name}" switch on exactly the prompts that are on right now?`, POPUP_TYPE.CONFIRM);
+    const preset = currentPresetName();
+    const confirmed = await callGenericPopup(textBlock(`Make "${name}" switch on exactly the prompts that are on right now?`), POPUP_TYPE.CONFIRM);
 
-    if (confirmed !== POPUP_RESULT.AFFIRMATIVE) {
+    if (confirmed !== POPUP_RESULT.AFFIRMATIVE || currentPresetName() !== preset || !data.sets[name]) {
         return;
     }
 
@@ -1065,7 +1095,15 @@ async function renameSelected(name) {
         return;
     }
 
-    const next = cleanName(await callGenericPopup(`New name for "${name}"`, POPUP_TYPE.INPUT, name));
+    const preset = currentPresetName();
+    const answer = await callGenericPopup(textBlock(`New name for "${name}"`), POPUP_TYPE.INPUT, name);
+
+    // Cancel gives false and Escape gives null; only a typed answer is a name.
+    if (typeof answer !== 'string' || currentPresetName() !== preset || !data.sets[name]) {
+        return;
+    }
+
+    const next = cleanName(answer);
 
     if (!next || next === name) {
         return;
@@ -1083,6 +1121,10 @@ async function renameSelected(name) {
 
     if (lastApplied?.name === name) {
         lastApplied.name = next;
+    }
+
+    if (lastApplied?.modifier === name) {
+        lastApplied.modifier = next;
     }
 
     saveSettingsDebounced();
@@ -1107,16 +1149,17 @@ async function deleteSelected(name) {
         lines.push('Anything linked to it uses its next link instead.');
     }
 
-    const confirmed = await callGenericPopup(lines.join('\n\n'), POPUP_TYPE.CONFIRM);
+    const preset = currentPresetName();
+    const confirmed = await callGenericPopup(textBlock(...lines), POPUP_TYPE.CONFIRM);
 
-    if (confirmed !== POPUP_RESULT.AFFIRMATIVE) {
+    if (confirmed !== POPUP_RESULT.AFFIRMATIVE || currentPresetName() !== preset || !data.sets[name]) {
         return;
     }
 
     removeKeeping(data.sets, name, rulesFor(data), [...orderIds()]);
-    relinkName(currentPresetName(), name, null);
+    relinkName(preset, name, null);
 
-    if (lastApplied?.name === name) {
+    if (lastApplied?.name === name || lastApplied?.modifier === name) {
         lastApplied = null;
     }
 
@@ -1175,7 +1218,7 @@ async function deleteSeveral() {
         }
     }
 
-    if (picked.includes(lastApplied?.name)) {
+    if (picked.includes(lastApplied?.name) || picked.includes(lastApplied?.modifier)) {
         lastApplied = null;
     }
 
@@ -1343,6 +1386,17 @@ async function checkNewPrompts() {
 const SECTION_HEADER = /^=+\s*.+?\s*=+$/;
 const SUB_HEADER = /^<.+>$/;
 
+/** Popup text built as elements: SillyTavern inserts a plain-string popup as HTML. */
+function textBlock(...paragraphs) {
+    const block = element('div', 'ps-text');
+
+    for (const text of paragraphs) {
+        block.appendChild(element('p', null, text));
+    }
+
+    return block;
+}
+
 function element(tag, className, text) {
     const node = document.createElement(tag);
 
@@ -1398,7 +1452,7 @@ async function editSet(name = null) {
     const state = {
         kind: existing?.kind ?? 'set',
         base: existing?.base ?? null,
-        modifiers: [...(existing?.modifiers ?? [])],
+        modifiers: (existing?.modifiers ?? []).filter(mod => data.sets[mod]?.kind === 'modifier'),
         final: new Set(existing?.kind === 'set' ? resolve(data.sets, name, rules).ids : []),
         change: new Map(existing?.kind === 'modifier'
             ? [...existing.on.map(id => [id, 'on']), ...existing.off.map(id => [id, 'off'])]
@@ -2029,17 +2083,17 @@ async function importSets(file) {
     // With sets already here, choose: replace them all, or add these and replace same names only.
     if (existing.length) {
         const choice = await callGenericPopup(
-            `"${preset}" already has ${plural(existing.length, 'set')}. Replace them all with the ones in this file, or add these to them? Adding replaces only sets with the same name.`,
+            textBlock(`"${preset}" already has ${plural(existing.length, 'set')}. Replace them all with the ones in this file, or add these to them? Adding replaces only sets with the same name.`),
             POPUP_TYPE.CONFIRM,
             '',
             { okButton: 'Replace all', cancelButton: 'Cancel', customButtons: [{ text: 'Add to them', result: POPUP_RESULT.CUSTOM1 }] },
         );
 
         if (choice === POPUP_RESULT.AFFIRMATIVE) {
-            const incoming = new Set(Object.keys(payload.sets).map(cleanName));
+            const incoming = new Map(Object.entries(payload.sets).map(([name, raw]) => [cleanName(name), normaliseSet(raw)?.kind]));
 
             for (const name of existing) {
-                if (!incoming.has(name)) {
+                if (incoming.get(name) !== data.sets[name].kind) {
                     relinkName(preset, name, null);
                 }
             }
@@ -2668,8 +2722,10 @@ async function onPresetLoaded() {
     }
 }
 
-function onPersonaDeleted(avatar) {
+function onPersonaDeleted(payload) {
     const settings = getSettings();
+    // SillyTavern sends { avatarId, name }; older versions may send the avatar itself.
+    const avatar = typeof payload === 'string' ? payload : payload?.avatarId;
 
     if (avatar) {
         delete settings.links[avatar];
@@ -2678,6 +2734,19 @@ function onPersonaDeleted(avatar) {
     }
 
     refreshUI();
+}
+
+/**
+ * A deleted preset keeps its sets and links, so importing it again brings them back, but it is
+ * unlocked: a new preset made with the same name shouldn't start out locked.
+ */
+function onPresetDeleted({ apiId, name } = {}) {
+    const data = apiId === 'openai' && name ? getSettings().presets[name] : null;
+
+    if (data?.locked) {
+        data.locked = false;
+        saveSettingsDebounced();
+    }
 }
 
 function onCharacterDeleted(event) {
@@ -2716,9 +2785,10 @@ globalThis.PresetSets = {
     get persona() { return user_avatar; },
     get card() { return currentCard(); },
     target: () => targetFor(),
-    ids: (name) => setIds(name ?? targetFor()?.name),
+    /** With a name, that set's prompts; without, what's linked now (set plus persona modifier). */
+    ids: (name) => (name ? setIds(name) : targetIds(targetFor())),
     plan: (name) => {
-        const ids = setIds(name ?? targetFor()?.name);
+        const ids = name ? setIds(name) : targetIds(targetFor());
         return ids && isReady() ? planApply(ids) : null;
     },
     problems: () => checkAll(presetData()?.sets || {}, rulesFor()),
@@ -2743,6 +2813,7 @@ jQuery(async () => {
 
     const optional = [
         [event_types.PRESET_RENAMED, onPresetRenamed],
+        [event_types.PRESET_DELETED, onPresetDeleted],
         [event_types.PERSONA_DELETED, onPersonaDeleted],
         [event_types.CHARACTER_DELETED, onCharacterDeleted],
         [event_types.CHARACTER_RENAMED, onCharacterRenamed],

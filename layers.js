@@ -279,10 +279,55 @@ export function checkAll(sets, rules) {
     return [...problems];
 }
 
-/** Read exclusivity markers from a prompt's text, as NemoEngine presets write them. */
+/**
+ * Read a prompt's markers the way NemoPresetExt does: every line inside each {{// … }} block.
+ * `withIds` holds the references as written (ids or prompt names); see resolveReference.
+ */
 export function readMarkers(text) {
-    const source = String(text || '');
-    const group = source.match(/\{\{\/\/\s*@(?:mutual-exclusive-group|exclusive-with-category)\s+([^}]*?)\s*\}\}/)?.[1] || null;
-    const withIds = source.match(/\{\{\/\/\s*@exclusive-with\s+([^}]*?)\s*\}\}/)?.[1]?.split(',').map(id => id.trim()).filter(Boolean) || [];
-    return { group, withIds };
+    const lines = markerLines(text);
+    let group = null;
+    const withIds = [];
+    let tooltip = null;
+
+    for (const line of lines) {
+        if (line.startsWith('@mutual-exclusive-group ')) {
+            group = line.slice('@mutual-exclusive-group '.length).trim() || null;
+        } else if (line.startsWith('@exclusive-with-category ')) {
+            group = line.slice('@exclusive-with-category '.length).trim() || null;
+        } else if (line.startsWith('@exclusive-with ')) {
+            withIds.push(...line.slice('@exclusive-with '.length).split(',').map(id => id.trim()).filter(Boolean));
+        } else if (line.startsWith('@tooltip ') && tooltip === null) {
+            tooltip = line.slice('@tooltip '.length).trim();
+        }
+    }
+
+    return { group, withIds, tooltip };
+}
+
+/** The trimmed lines inside every {{// … }} block of a prompt's text. */
+export function markerLines(text) {
+    const lines = [];
+    const blocks = /\{\{\/\/([\s\S]*?)\}\}/g;
+    let match;
+
+    while ((match = blocks.exec(String(text || ''))) !== null) {
+        for (const line of match[1].split(/\r?\n/)) {
+            const trimmed = line.trim();
+
+            if (trimmed) {
+                lines.push(trimmed);
+            }
+        }
+    }
+
+    return lines;
+}
+
+/** How NemoPresetExt compares a reference with a prompt id or name. */
+export function normaliseReference(value) {
+    return String(value ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/^[^\p{Letter}\p{Number}]+/u, '')
+        .replace(/\s+/g, ' ');
 }
