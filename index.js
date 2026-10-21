@@ -1,6 +1,6 @@
 import { eventSource, event_types, main_api, saveSettingsDebounced } from '../../../../script.js';
 import { oai_settings, openai_settings, openai_setting_names, promptManager } from '../../../openai.js';
-import { extension_settings } from '../../../extensions.js';
+import { extension_settings, getContext } from '../../../extensions.js';
 import { user_avatar } from '../../../personas.js';
 import { power_user } from '../../../power-user.js';
 import { Popup, POPUP_TYPE, POPUP_RESULT, callGenericPopup } from '../../../popup.js';
@@ -8,11 +8,15 @@ import { download } from '../../../utils.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import {
+    allDependants, changesBetween, checkAll, directDependants, excludes, inherited,
+    normaliseSet, possibleBases, readMarkers, removeKeeping, renameReferences, resolve,
+} from './layers.js';
 
 const MODULE_NAME = 'presetSets';
 const LOG = '[Preset Sets]';
 const EXPORT_FORMAT = 'preset-sets';
-const EXPORT_VERSION = 1;
+const EXPORT_VERSION = 2;
 
 const defaultSettings = {
     /** Apply the linked set whenever the persona, chat or preset changes, and before each generation. */
@@ -20,19 +24,28 @@ const defaultSettings = {
     /** Show a notice when a set is applied automatically. */
     notify: true,
     /**
-     * Sets, per Chat Completion preset name:
-     * { [presetName]: { sets: { [setName]: { ids: string[], updated: string } }, defaultSet: string|null, locked: boolean } }
-     * A locked preset can only change its toggles through sets, and can't be updated, renamed or deleted.
+     * Per Chat Completion preset name:
+     * { sets: { [name]: Set }, defaultSet, locked, known: string[], markers: { groups, withIds } }
+     * A Set is { kind: 'set'|'modifier', base, modifiers, on, off, updated } (see layers.js).
+     * `known` is every prompt seen so far, so new prompts can be offered to sets.
+     * `markers` caches which prompts exclude each other, read from the prompt text.
      */
     presets: {},
-    /** Which set each persona uses, per preset: { [personaAvatar]: { [presetName]: setName } } */
+    /** Persona links: { [personaAvatar]: { [preset]: setName } } */
     links: {},
+    /** Character card (or group chat) links: { [cardKey]: { [preset]: setName } } */
+    cardLinks: {},
+    /** Persona-with-card links: { [personaAvatar]: { [cardKey]: { [preset]: setName } } } */
+    pairLinks: {},
 };
 
-/** Missing-prompt warnings already shown this session, so a stale set doesn't warn on every message. */
-const warnedMissing = new Set();
+const EMPTY_RULES = Object.freeze({ groupOf: new Map(), withIds: new Map() });
 
-/** The last automatic or manual apply, for the status line. */
+/** Notices already shown this session, so a stale set doesn't warn on every message. */
+const warnedMissing = new Set();
+const reportedProblems = new Set();
+
+/** The last automatic or manual apply. */
 let lastApplied = null;
 
 // ---------------------------------------------------------------------------------------------
@@ -60,6 +73,8 @@ function currentPresetName() {
     return oai_settings?.preset_settings_openai || null;
 }
 
+const normalised = new WeakSet();
+
 /** The stored sets for a preset. With `create`, an empty record is made if there is none. */
 function presetData(name = currentPresetName(), create = false) {
     if (!name) {
@@ -74,8 +89,20 @@ function presetData(name = currentPresetName(), create = false) {
 
     const data = settings.presets[name];
 
-    if (data) {
+    if (data && !normalised.has(data)) {
         data.sets ??= {};
+
+        // Version 1 sets were full lists; they become sets with no base.
+        for (const [setName, raw] of Object.entries(data.sets)) {
+            const set = normaliseSet(raw);
+
+            if (set) {
+                data.sets[setName] = set;
+            } else {
+                delete data.sets[setName];
+            }
+        }
+
         data.locked = Boolean(data.locked);
 
         if (data.defaultSet === undefined) {
@@ -84,6 +111,7 @@ function presetData(name = currentPresetName(), create = false) {
 
         // Guarded prompts were removed in favour of the preset lock.
         delete data.guarded;
+        normalised.add(data);
     }
 
     return data || null;
@@ -93,8 +121,23 @@ function personaName(avatar = user_avatar) {
     return power_user.personas?.[avatar] || avatar || 'no persona';
 }
 
-function setNames(data = presetData()) {
-    return data ? Object.keys(data.sets).sort((a, b) => a.localeCompare(b)) : [];
+/** Names in this preset, sorted. `kind` limits them to sets or to modifiers. */
+function setNames(data = presetData(), kind = null) {
+    if (!data) {
+        return [];
+    }
+
+    return Object.keys(data.sets)
+        .filter(name => !kind || data.sets[name].kind === kind)
+        .sort((a, b) => a.localeCompare(b));
+}
+
+function cleanName(value) {
+    return String(value ?? '').trim().replace(/\s+/g, ' ');
+}
+
+function plural(count, word) {
+    return `${count} ${word}${count === 1 ? '' : 's'}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,12 +185,12 @@ function readRows() {
     return rows;
 }
 
-/** The identifiers of every switched-on prompt, which is what a set stores. */
+/** The identifiers of every switched-on prompt. */
 function captureIds() {
     return readRows().filter(row => row.enabled).map(row => row.id);
 }
 
-/** Every prompt in the active order, toggleable or not. */
+/** Every prompt in the active order, toggleable or not, in order. */
 function orderIds() {
     const pm = promptManager;
     const order = pm.getPromptOrderForCharacter(pm.activeCharacter) || [];
@@ -155,9 +198,8 @@ function orderIds() {
 }
 
 /**
- * What applying a set would change, without changing anything. A set listing a prompt that
- * can't be toggled (a marker, say) simply leaves it alone; only prompts the preset doesn't
- * have at all count as missing.
+ * What applying a list of prompts would change, without changing anything. A prompt that can't be
+ * toggled (a marker, say) is left alone; only prompts the preset doesn't have count as missing.
  */
 function planApply(ids, rows = readRows()) {
     const wanted = new Set(ids);
@@ -169,8 +211,11 @@ function planApply(ids, rows = readRows()) {
     };
 }
 
+/** True while this extension is switching prompts itself, so the lock lets those changes through. */
+let applying = false;
+
 /**
- * Switch prompts on and off to match a set. Prompts the set doesn't list are switched off.
+ * Switch prompts on and off to match a list. Prompts not listed are switched off.
  * Only the live toggles change; the preset file on disk is not touched.
  */
 async function applyIds(ids) {
@@ -224,49 +269,383 @@ function serial(task) {
     return run;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Exclusive prompts and layers
+// ---------------------------------------------------------------------------------------------
+
+const rulesCache = new WeakMap();
+
+function toRules(markers) {
+    if (!markers) {
+        return EMPTY_RULES;
+    }
+
+    let rules = rulesCache.get(markers);
+
+    if (!rules) {
+        rules = {
+            groupOf: new Map(Object.entries(markers.groups || {})),
+            withIds: new Map(Object.entries(markers.withIds || {})),
+        };
+        rulesCache.set(markers, rules);
+    }
+
+    return rules;
+}
+
+/** Which prompts exclude each other in this preset, as last read from the prompt text. */
+function rulesFor(data = presetData()) {
+    return toRules(data?.markers);
+}
+
 /**
- * The set that should be active: the persona's link for this preset if it exists, otherwise the
- * preset's set for unlinked personas, otherwise none. A link to a deleted set falls through to the
- * unlinked set, so a missing set never leaves an unexpected state in place.
+ * Read the exclusivity markers from every prompt's text. NemoPresetExt can keep switched-off
+ * prompts' text out of memory, so the text is read through it when it is installed.
  */
-function targetFor(avatar = user_avatar, preset = currentPresetName()) {
+async function readAllMarkers() {
+    const cold = globalThis.NemoColdPrompts;
+    const prompts = promptManager.serviceSettings.prompts;
+
+    const found = await Promise.all(prompts.map(async prompt => {
+        let text = prompt?.content ?? '';
+
+        if (typeof cold?.readBody === 'function') {
+            try {
+                text = (await cold.readBody(prompt)) ?? text;
+            } catch (error) {
+                console.warn(LOG, `Could not read "${prompt?.name}" through NemoPresetExt`, error);
+            }
+        }
+
+        return [prompt.identifier, readMarkers(text)];
+    }));
+
+    const groups = {};
+    const withIds = {};
+
+    for (const [id, marks] of found) {
+        if (marks.group) {
+            groups[id] = marks.group;
+        }
+
+        if (marks.withIds.length) {
+            withIds[id] = marks.withIds;
+        }
+    }
+
+    return { groups, withIds };
+}
+
+/** Re-read the markers, keep them with the preset's sets, and return the rules. */
+async function refreshRules() {
+    if (!isReady()) {
+        return EMPTY_RULES;
+    }
+
+    const preset = currentPresetName();
+    const markers = await readAllMarkers();
+    const data = presetData();
+
+    if (!data || currentPresetName() !== preset) {
+        return toRules(markers);
+    }
+
+    if (JSON.stringify(markers) !== JSON.stringify(data.markers)) {
+        data.markers = markers;
+        saveSettingsDebounced();
+    }
+
+    return rulesFor(data);
+}
+
+/** The prompts a set switches on, with its base and modifiers worked in. */
+function setIds(name, data = presetData()) {
+    if (!data?.sets[name]) {
+        return null;
+    }
+
+    const { ids, problems } = resolve(data.sets, name, rulesFor(data));
+
+    for (const problem of problems) {
+        const key = `${currentPresetName()}\u0000${problem}`;
+
+        if (!reportedProblems.has(key)) {
+            reportedProblems.add(key);
+            toastr.warning(problem, 'Preset Sets');
+        }
+    }
+
+    return [...ids];
+}
+
+/** Remember every prompt the preset has, so later additions can be offered to sets. */
+function ensureKnown(data) {
+    if (data && !Array.isArray(data.known) && isReady()) {
+        data.known = readRows().map(row => row.id);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Links: persona, character card, persona with card
+// ---------------------------------------------------------------------------------------------
+
+/** The open character card, or group chat, as a stable key and a display name. */
+function currentCard() {
+    let context;
+
+    try {
+        context = getContext();
+    } catch {
+        return null;
+    }
+
+    if (context?.groupId) {
+        const group = context.groups?.find(item => String(item.id) === String(context.groupId));
+        return { key: `group:${context.groupId}`, name: group?.name || 'this group chat' };
+    }
+
+    const character = context?.characterId !== undefined ? context.characters?.[context.characterId] : null;
+    return character?.avatar ? { key: character.avatar, name: character.name || character.avatar } : null;
+}
+
+function linkPath(kind, preset, avatar, card) {
+    const settings = getSettings();
+
+    if (kind === 'persona') {
+        return [settings.links, [avatar, preset]];
+    }
+
+    if (kind === 'card') {
+        return [settings.cardLinks, [card, preset]];
+    }
+
+    return [settings.pairLinks, [avatar, card, preset]];
+}
+
+function getLink(kind, preset = currentPresetName(), avatar = user_avatar, card = currentCard()?.key) {
+    const [root, keys] = linkPath(kind, preset, avatar, card);
+
+    if (keys.some(key => !key)) {
+        return null;
+    }
+
+    return keys.reduce((node, key) => node?.[key], root) ?? null;
+}
+
+function setLink(kind, name, preset = currentPresetName(), avatar = user_avatar, card = currentCard()?.key) {
+    const [root, keys] = linkPath(kind, preset, avatar, card);
+
+    if (keys.some(key => !key)) {
+        return;
+    }
+
+    let node = root;
+    const trail = [];
+
+    for (const key of keys.slice(0, -1)) {
+        node[key] ??= {};
+        trail.push([node, key]);
+        node = node[key];
+    }
+
+    if (name) {
+        node[keys.at(-1)] = name;
+    } else {
+        delete node[keys.at(-1)];
+
+        // Tidy away empty records.
+        for (const [parent, key] of trail.reverse()) {
+            if (Object.keys(parent[key]).length) {
+                break;
+            }
+
+            delete parent[key];
+        }
+    }
+
+    saveSettingsDebounced();
+}
+
+/**
+ * The set that should be active. The most specific link wins: this persona with this card, then
+ * this persona, then this card, then the preset's set for anything without a link. A link to a set
+ * that no longer exists is skipped, so a missing set never leaves an unexpected state in place.
+ */
+function targetFor(avatar = user_avatar, preset = currentPresetName(), card = currentCard()?.key) {
     const data = presetData(preset);
 
     if (!data) {
         return null;
     }
 
-    const linked = getSettings().links?.[avatar]?.[preset];
+    const broken = [];
+    const candidates = [
+        ['pair', getLink('pair', preset, avatar, card)],
+        ['persona', getLink('persona', preset, avatar, card)],
+        ['card', getLink('card', preset, avatar, card)],
+        ['default', data.defaultSet],
+    ];
 
-    if (linked && data.sets[linked]) {
-        return { name: linked, source: 'persona', set: data.sets[linked] };
+    for (const [source, name] of candidates) {
+        if (!name) {
+            continue;
+        }
+
+        if (data.sets[name]?.kind === 'set') {
+            return { name, source, broken };
+        }
+
+        broken.push(name);
     }
 
-    if (data.defaultSet && data.sets[data.defaultSet]) {
-        return { name: data.defaultSet, source: 'default', set: data.sets[data.defaultSet], brokenLink: linked || null };
-    }
-
-    return linked ? { name: null, source: 'none', set: null, brokenLink: linked } : null;
+    return broken.length ? { name: null, source: 'none', broken } : null;
 }
+
+function sourceText(source) {
+    const card = currentCard()?.name || 'this card';
+
+    switch (source) {
+        case 'pair': return `linked to ${personaName()} with ${card}`;
+        case 'persona': return `linked to ${personaName()}`;
+        case 'card': return `linked to ${card}`;
+        default: return 'for anything without a link';
+    }
+}
+
+/** When a set is renamed or deleted, move or drop every link and default that named it. */
+function relinkName(preset, from, to) {
+    const settings = getSettings();
+    const data = presetData(preset);
+
+    if (data && data.defaultSet === from) {
+        data.defaultSet = to;
+    }
+
+    const fix = (record) => {
+        if (record?.[preset] === from) {
+            if (to) {
+                record[preset] = to;
+            } else {
+                delete record[preset];
+            }
+        }
+    };
+
+    Object.values(settings.links).forEach(fix);
+    Object.values(settings.cardLinks).forEach(fix);
+    Object.values(settings.pairLinks).forEach(byCard => Object.values(byCard || {}).forEach(fix));
+}
+
+async function chooseLinks(name) {
+    const data = presetData();
+
+    if (!data?.sets[name] || data.sets[name].kind !== 'set') {
+        return;
+    }
+
+    const card = currentCard();
+    const content = document.createElement('div');
+    content.classList.add('ps-links');
+
+    const heading = document.createElement('h3');
+    heading.textContent = `Use "${name}" for`;
+    content.appendChild(heading);
+
+    const choices = [
+        ['persona', `${personaName()}, with any card`],
+        ['card', card ? `${card.name}, with any persona that has no link of its own` : 'a character card (open a chat first)'],
+        ['pair', card ? `${personaName()} with ${card.name}` : `${personaName()} with a card (open a chat first)`],
+    ];
+
+    const boxes = {};
+
+    for (const [kind, label] of choices) {
+        const row = document.createElement('label');
+        row.classList.add('checkbox_label');
+
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        const current = getLink(kind);
+        box.checked = current === name;
+        box.disabled = kind !== 'persona' && !card;
+
+        const text = document.createElement('span');
+        text.textContent = label;
+        row.append(box, text);
+
+        if (current && current !== name) {
+            const now = document.createElement('span');
+            now.classList.add('opacity50p');
+            now.textContent = ` (now "${current}")`;
+            row.appendChild(now);
+        }
+
+        boxes[kind] = { box, current };
+        content.appendChild(row);
+    }
+
+    const hint = document.createElement('div');
+    hint.classList.add('opacity50p');
+    hint.textContent = 'The most specific link wins: persona with card, then persona, then card, then the set for anything without a link.';
+    content.appendChild(hint);
+
+    const result = await callGenericPopup(content, POPUP_TYPE.CONFIRM, '', { okButton: 'Save', cancelButton: 'Cancel' });
+
+    if (result !== POPUP_RESULT.AFFIRMATIVE) {
+        return;
+    }
+
+    for (const [kind, { box, current }] of Object.entries(boxes)) {
+        if (box.disabled) {
+            continue;
+        }
+
+        if (box.checked) {
+            setLink(kind, name);
+        } else if (current === name) {
+            setLink(kind, null);
+        }
+    }
+
+    refreshUI(name);
+    await autoApply();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Applying
+// ---------------------------------------------------------------------------------------------
 
 function reportApply(name, result, automatic) {
     const settings = getSettings();
     const key = `${currentPresetName()}\u0000${name}`;
 
     if (result.changed && (!automatic || settings.notify)) {
-        toastr.info(`Applied "${name}" for ${personaName()} (${result.changed} change${result.changed === 1 ? '' : 's'}).`, 'Preset Sets');
+        toastr.info(`Applied "${name}" (${plural(result.changed, 'change')}).`, 'Preset Sets');
     } else if (!automatic && !result.changed) {
         toastr.info(`"${name}" is already applied.`, 'Preset Sets');
     }
 
     if (result.missing.length && (!automatic || !warnedMissing.has(key))) {
         warnedMissing.add(key);
-        toastr.warning(`"${name}" lists ${result.missing.length} prompt(s) this preset no longer has. Update the set to clear this.`, 'Preset Sets');
+        toastr.warning(`"${name}" lists ${plural(result.missing.length, 'prompt')} this preset no longer has. Edit or update the set to clear this.`, 'Preset Sets');
     }
 
     if (result.remaining.length) {
         toastr.error(`Some prompts could not be switched: ${result.remaining.slice(0, 5).join(', ')}${result.remaining.length > 5 ? '…' : ''}`, 'Preset Sets');
     }
+}
+
+async function applySet(name, source, automatic) {
+    const ids = setIds(name);
+
+    if (!ids) {
+        return null;
+    }
+
+    const result = await applyIds(ids);
+    lastApplied = { preset: currentPresetName(), name, source, ...result };
+    reportApply(name, result, automatic);
+    return result;
 }
 
 /** Apply the linked set, if there is one and automatic applying is on. */
@@ -281,14 +660,12 @@ async function autoApply() {
     return serial(async () => {
         const target = targetFor();
 
-        if (!target?.set) {
+        if (!target?.name) {
             refreshUI();
             return null;
         }
 
-        const result = await applyIds(target.set.ids);
-        lastApplied = { preset: currentPresetName(), name: target.name, source: target.source, persona: user_avatar, ...result };
-        reportApply(target.name, result, true);
+        const result = await applySet(target.name, target.source, true);
         refreshUI();
         return { target, result };
     });
@@ -307,18 +684,43 @@ async function applyNamed(name) {
         return null;
     }
 
+    if (data.sets[name].kind !== 'set') {
+        toastr.warning(`"${name}" is a modifier. Modifiers are stacked onto sets, not applied by themselves.`, 'Preset Sets');
+        return null;
+    }
+
     return serial(async () => {
-        const result = await applyIds(data.sets[name].ids);
-        lastApplied = { preset: currentPresetName(), name, source: 'manual', persona: user_avatar, ...result };
-        reportApply(name, result, false);
+        const result = await applySet(name, 'manual', false);
         refreshUI();
         return result;
     });
 }
 
 /**
+ * After a set changes, put the set in use back in place, since its prompts (or those of a set it
+ * builds on) may have changed.
+ */
+async function reapplyInUse() {
+    if (!isReady()) {
+        refreshUI();
+        return;
+    }
+
+    const data = presetData();
+    const preset = currentPresetName();
+    const kept = lastApplied?.preset === preset && data?.sets[lastApplied.name]?.kind === 'set' ? lastApplied : null;
+    const target = kept ? { name: kept.name, source: kept.source } : (getSettings().autoApply ? targetFor() : null);
+
+    if (target?.name) {
+        await serial(() => applySet(target.name, target.source, true));
+    }
+
+    refreshUI();
+}
+
+/**
  * Runs before every generation (registered as the manifest's generate_interceptor), so the
- * persona's set is in place whatever happened to the toggles since it was last applied.
+ * linked set is in place whatever happened to the toggles since it was last applied.
  */
 globalThis.presetSetsPreflight = async function () {
     if (!isReady()) {
@@ -337,8 +739,6 @@ globalThis.presetSetsPreflight = async function () {
 // Preset lock
 // ---------------------------------------------------------------------------------------------
 
-/** True while this extension is switching prompts itself, so the lock lets those changes through. */
-let applying = false;
 let lockNoticeAt = 0;
 
 function isLocked(preset = currentPresetName()) {
@@ -362,8 +762,9 @@ function savedPresetIds(preset = currentPresetName()) {
  */
 function enforcedIds() {
     const preset = currentPresetName();
-    const set = lastApplied?.preset === preset && lastApplied.name ? presetData(preset)?.sets[lastApplied.name] : null;
-    return set ? set.ids : savedPresetIds(preset);
+    const data = presetData(preset);
+    const name = lastApplied?.preset === preset && data?.sets[lastApplied.name]?.kind === 'set' ? lastApplied.name : null;
+    return name ? setIds(name, data) : savedPresetIds(preset);
 }
 
 function lockNotice(message) {
@@ -396,7 +797,7 @@ function installLockHook() {
 
     const original = pm.saveServiceSettings;
 
-    const locked = async function (...args) {
+    pm.saveServiceSettings = async function (...args) {
         let reverted = 0;
 
         if (!applying && isReady() && isLocked()) {
@@ -430,8 +831,6 @@ function installLockHook() {
         scheduleBarRefresh();
         return result;
     };
-
-    pm.saveServiceSettings = locked;
 }
 
 /** The preset's own update, rename and delete buttons do nothing while it is locked. */
@@ -474,12 +873,16 @@ function onPresetRenamed({ apiId, oldName, newName } = {}) {
     settings.presets[newName] = settings.presets[oldName];
     delete settings.presets[oldName];
 
-    for (const links of Object.values(settings.links)) {
-        if (links?.[oldName]) {
-            links[newName] = links[oldName];
-            delete links[oldName];
+    const move = (record) => {
+        if (record?.[oldName]) {
+            record[newName] = record[oldName];
+            delete record[oldName];
         }
-    }
+    };
+
+    Object.values(settings.links).forEach(move);
+    Object.values(settings.cardLinks).forEach(move);
+    Object.values(settings.pairLinks).forEach(byCard => Object.values(byCard || {}).forEach(move));
 
     if (lastApplied?.preset === oldName) {
         lastApplied.preset = newName;
@@ -493,36 +896,43 @@ function onPresetRenamed({ apiId, oldName, newName } = {}) {
 // Set management
 // ---------------------------------------------------------------------------------------------
 
-function cleanName(value) {
-    return String(value ?? '').trim().replace(/\s+/g, ' ');
+/** Save the toggles switched on now into a set, keeping what it builds on. */
+function storeToggles(data, name) {
+    const rules = rulesFor(data);
+    const order = [...orderIds()];
+    const existing = data.sets[name];
+    const target = captureIds();
+
+    if (existing && existing.kind === 'set') {
+        const from = inherited(data.sets, name, existing, rules).ids;
+        const { on, off } = changesBetween(from, target, rules, order);
+        data.sets[name] = { ...existing, on, off, updated: new Date().toISOString() };
+    } else {
+        data.sets[name] = { kind: 'set', base: null, modifiers: [], on: target, off: [], updated: new Date().toISOString() };
+    }
+
+    ensureKnown(data);
+    warnedMissing.delete(`${currentPresetName()}\u0000${name}`);
+    saveSettingsDebounced();
 }
 
-async function saveCurrentAsNew(nameArg) {
+async function saveFromToggles(name) {
     if (!isReady()) {
         toastr.warning('Load a Chat Completion preset first.', 'Preset Sets');
         return null;
     }
 
-    const name = cleanName(nameArg ?? await callGenericPopup('Name for the new set', POPUP_TYPE.INPUT, ''));
+    const data = presetData(currentPresetName(), true);
 
-    if (!name) {
+    if (data.sets[name]?.kind === 'modifier') {
+        toastr.error(`"${name}" is a modifier. Edit it instead.`, 'Preset Sets');
         return null;
     }
 
-    const data = presetData(currentPresetName(), true);
-
-    if (data.sets[name] && nameArg === undefined) {
-        const confirmed = await callGenericPopup(`A set called "${name}" already exists. Replace it with the current toggles?`, POPUP_TYPE.CONFIRM);
-
-        if (confirmed !== POPUP_RESULT.AFFIRMATIVE) {
-            return null;
-        }
-    }
-
-    data.sets[name] = { ids: captureIds(), updated: new Date().toISOString() };
-    saveSettingsDebounced();
+    storeToggles(data, name);
+    await reapplyInUse();
     refreshUI(name);
-    toastr.success(`Saved "${name}" with ${data.sets[name].ids.length} prompt(s) on.`, 'Preset Sets');
+    toastr.success(`Saved "${name}" with ${plural(setIds(name).length, 'prompt')} on.`, 'Preset Sets');
     return name;
 }
 
@@ -533,36 +943,21 @@ async function updateSelected(name) {
         return;
     }
 
-    const confirmed = await callGenericPopup(`Replace "${name}" with the prompts switched on right now?`, POPUP_TYPE.CONFIRM);
+    if (data.sets[name].kind !== 'set') {
+        toastr.info(`"${name}" is a modifier. Use Edit to change it.`, 'Preset Sets');
+        return;
+    }
+
+    const confirmed = await callGenericPopup(`Make "${name}" switch on exactly the prompts that are on right now?`, POPUP_TYPE.CONFIRM);
 
     if (confirmed !== POPUP_RESULT.AFFIRMATIVE) {
         return;
     }
 
-    data.sets[name] = { ids: captureIds(), updated: new Date().toISOString() };
-    warnedMissing.delete(`${currentPresetName()}\u0000${name}`);
-    saveSettingsDebounced();
+    storeToggles(data, name);
+    await reapplyInUse();
     refreshUI(name);
     toastr.success(`Updated "${name}".`, 'Preset Sets');
-}
-
-function relinkName(preset, from, to) {
-    const settings = getSettings();
-    const data = presetData(preset);
-
-    if (data && data.defaultSet === from) {
-        data.defaultSet = to;
-    }
-
-    for (const links of Object.values(settings.links)) {
-        if (links?.[preset] === from) {
-            if (to) {
-                links[preset] = to;
-            } else {
-                delete links[preset];
-            }
-        }
-    }
 }
 
 async function renameSelected(name) {
@@ -579,13 +974,19 @@ async function renameSelected(name) {
     }
 
     if (data.sets[next]) {
-        toastr.error(`A set called "${next}" already exists.`, 'Preset Sets');
+        toastr.error(`"${next}" already exists.`, 'Preset Sets');
         return;
     }
 
     data.sets[next] = data.sets[name];
     delete data.sets[name];
+    renameReferences(data.sets, name, next);
     relinkName(currentPresetName(), name, next);
+
+    if (lastApplied?.name === name) {
+        lastApplied.name = next;
+    }
+
     saveSettingsDebounced();
     refreshUI(next);
 }
@@ -597,38 +998,175 @@ async function deleteSelected(name) {
         return;
     }
 
-    const confirmed = await callGenericPopup(`Delete the set "${name}"? Personas linked to it will use the set for unlinked personas instead.`, POPUP_TYPE.CONFIRM);
+    const dependants = directDependants(data.sets, name);
+    const lines = [`Delete "${name}"?`];
+
+    if (dependants.length) {
+        lines.push(`${plural(dependants.length, 'set')} use${dependants.length === 1 ? 's' : ''} it (${dependants.join(', ')}). They will keep switching on exactly the prompts they do now.`);
+    }
+
+    if (data.sets[name].kind === 'set') {
+        lines.push('Anything linked to it uses its next link instead.');
+    }
+
+    const confirmed = await callGenericPopup(lines.join('\n\n'), POPUP_TYPE.CONFIRM);
 
     if (confirmed !== POPUP_RESULT.AFFIRMATIVE) {
         return;
     }
 
-    delete data.sets[name];
+    removeKeeping(data.sets, name, rulesFor(data), [...orderIds()]);
     relinkName(currentPresetName(), name, null);
+
+    if (lastApplied?.name === name) {
+        lastApplied = null;
+    }
+
     saveSettingsDebounced();
     refreshUI();
+    await autoApply();
 }
 
-function setLink(avatar, preset, name) {
-    const settings = getSettings();
+// ---------------------------------------------------------------------------------------------
+// New prompts
+// ---------------------------------------------------------------------------------------------
 
-    if (!avatar || !preset) {
+let noticeOpen = false;
+
+/** Switch a prompt on in a set or modifier, replacing anything in it that the prompt excludes. */
+function addPrompt(set, id, rules, order) {
+    set.off = set.off.filter(other => other !== id);
+
+    if (!set.on.includes(id)) {
+        set.on = set.on.filter(other => !excludes(rules, id, other));
+        set.on.push(id);
+        const rank = new Map(order.map((item, index) => [item, index]));
+        set.on.sort((a, b) => (rank.get(a) ?? Infinity) - (rank.get(b) ?? Infinity));
+    }
+
+    set.updated = new Date().toISOString();
+}
+
+/**
+ * When the preset has prompts it didn't have last time (a new version imported, say), ask which
+ * sets each should be on in. Anything left unticked stays off everywhere.
+ */
+async function checkNewPrompts() {
+    if (!isReady() || noticeOpen) {
         return;
     }
 
-    settings.links[avatar] ??= {};
+    const preset = currentPresetName();
+    const data = presetData(preset);
 
-    if (name) {
-        settings.links[avatar][preset] = name;
-    } else {
-        delete settings.links[avatar][preset];
-
-        if (!Object.keys(settings.links[avatar]).length) {
-            delete settings.links[avatar];
-        }
+    if (!data || !Object.keys(data.sets).length) {
+        return;
     }
 
-    saveSettingsDebounced();
+    const rows = readRows();
+    const current = rows.map(row => row.id);
+
+    if (!Array.isArray(data.known)) {
+        data.known = current;
+        saveSettingsDebounced();
+        return;
+    }
+
+    const known = new Set(data.known);
+    const fresh = rows.filter(row => !known.has(row.id));
+
+    if (!fresh.length) {
+        if (known.size !== current.length) {
+            data.known = current;
+            saveSettingsDebounced();
+        }
+
+        return;
+    }
+
+    noticeOpen = true;
+
+    try {
+        const names = [...setNames(data, 'set'), ...setNames(data, 'modifier')];
+        const content = document.createElement('div');
+        content.classList.add('ps-new');
+
+        const heading = document.createElement('h3');
+        heading.textContent = `${plural(fresh.length, 'new prompt')} in "${preset}"`;
+
+        const hint = document.createElement('div');
+        hint.classList.add('opacity50p');
+        hint.textContent = 'Tick the sets each one should be on in. Sets that build on a ticked set, or use a ticked modifier, get it too. Anything left unticked stays off everywhere, and you won\'t be asked about it again.';
+
+        content.append(heading, hint);
+        const picks = [];
+
+        for (const row of fresh) {
+            const block = document.createElement('div');
+            block.classList.add('ps-new-row');
+
+            const title = document.createElement('b');
+            title.textContent = row.name;
+
+            const chips = document.createElement('div');
+            chips.classList.add('ps-chips');
+
+            for (const name of names) {
+                const label = document.createElement('label');
+                label.classList.add('checkbox_label', 'ps-chip');
+
+                const box = document.createElement('input');
+                box.type = 'checkbox';
+
+                const text = document.createElement('span');
+                text.textContent = data.sets[name].kind === 'modifier' ? `${name} (modifier)` : name;
+
+                const reaches = allDependants(data.sets, name);
+                label.title = reaches.length ? `Also reaches ${reaches.join(', ')}` : '';
+
+                label.append(box, text);
+                chips.appendChild(label);
+                picks.push({ id: row.id, name, box });
+            }
+
+            block.append(title, chips);
+            content.appendChild(block);
+        }
+
+        const result = await callGenericPopup(content, POPUP_TYPE.CONFIRM, '', {
+            okButton: 'Save',
+            cancelButton: 'Ask me later',
+            wide: true,
+            allowVerticalScrolling: true,
+        });
+
+        if (result !== POPUP_RESULT.AFFIRMATIVE || currentPresetName() !== preset) {
+            return;
+        }
+
+        const rules = rulesFor(data);
+        const order = [...orderIds()];
+        let added = 0;
+
+        for (const pick of picks) {
+            if (pick.box.checked && data.sets[pick.name]) {
+                addPrompt(data.sets[pick.name], pick.id, rules, order);
+                added++;
+            }
+        }
+
+        data.known = current;
+        saveSettingsDebounced();
+
+        if (added) {
+            toastr.success(`Added ${plural(added, 'prompt')} to sets.`, 'Preset Sets');
+            await reapplyInUse();
+        }
+
+        refreshUI();
+    } finally {
+        noticeOpen = false;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -638,68 +1176,37 @@ function setLink(avatar, preset, name) {
 const SECTION_HEADER = /^=+\s*.+?\s*=+$/;
 const SUB_HEADER = /^<.+>$/;
 
-/**
- * NemoPresetExt marks prompts that can't be on together with directives in the prompt text:
- * `@mutual-exclusive-group <name>` (or `@exclusive-with-category`) and `@exclusive-with <ids>`.
- * NemoPresetExt can keep switched-off prompts' text out of memory, so it is read through its API.
- */
-async function readExclusions(rows) {
-    const prompts = new Map(promptManager.serviceSettings.prompts.map(prompt => [prompt.identifier, prompt]));
-    const cold = globalThis.NemoColdPrompts;
-    const result = new Map();
+function element(tag, className, text) {
+    const node = document.createElement(tag);
 
-    await Promise.all(rows.map(async row => {
-        const prompt = prompts.get(row.id);
-        let text = prompt?.content ?? '';
+    if (className) {
+        node.className = className;
+    }
 
-        if (typeof cold?.readBody === 'function') {
-            try {
-                text = (await cold.readBody(prompt)) ?? text;
-            } catch (error) {
-                console.warn(LOG, `Could not read "${row.name}" through NemoPresetExt`, error);
-            }
-        }
+    if (text !== undefined) {
+        node.textContent = text;
+    }
 
-        text = String(text || '');
-        const group = text.match(/\{\{\/\/\s*@(?:mutual-exclusive-group|exclusive-with-category)\s+([^}]*?)\s*\}\}/)?.[1] || null;
-        const withIds = text.match(/\{\{\/\/\s*@exclusive-with\s+([^}]*?)\s*\}\}/)?.[1]?.split(',').map(id => id.trim()).filter(Boolean) || [];
-
-        if (group || withIds.length) {
-            result.set(row.id, { group, withIds });
-        }
-    }));
-
-    return result;
+    return node;
 }
 
-function makeCheckbox(row, checked, exclusion) {
-    const label = document.createElement('label');
-    label.classList.add('checkbox_label', 'ps-editor-row');
-    label.dataset.name = row.name.toLowerCase();
+function makeSelect(options, value) {
+    const select = element('select', 'text_pole');
 
-    if (SUB_HEADER.test(row.name)) {
-        label.classList.add('ps-editor-sub');
+    for (const [optionValue, label] of options) {
+        const option = element('option', null, label);
+        option.value = optionValue;
+        select.appendChild(option);
     }
 
-    const box = document.createElement('input');
-    box.type = 'checkbox';
-    box.value = row.id;
-    box.checked = checked;
-
-    if (exclusion?.group) {
-        box.dataset.group = exclusion.group;
-    }
-
-    const text = document.createElement('span');
-    text.textContent = row.name;
-
-    label.append(box, text);
-    return label;
+    select.value = value ?? '';
+    return select;
 }
 
 /**
- * Edit which prompts a set switches on, without touching the prompt manager. With no name, this
- * makes a new set starting from the prompts switched on now.
+ * Edit a set or modifier, or make a new one (no name). A set is edited as the prompts it switches
+ * on, and only its differences from what it builds on are stored. A modifier is edited as a list
+ * of changes: switch on, switch off, or leave alone.
  */
 async function editSet(name = null) {
     if (!isReady()) {
@@ -714,146 +1221,374 @@ async function editSet(name = null) {
         return null;
     }
 
+    const rules = await refreshRules();
     const rows = readRows();
-    const exclusions = await readExclusions(rows);
-    const start = new Set(name ? data.sets[name].ids : captureIds());
+    const order = [...orderIds()];
+    const existing = name ? data.sets[name] : null;
+    const modifiers = setNames(data, 'modifier');
 
-    const content = document.createElement('div');
-    content.classList.add('ps-editor');
+    const state = {
+        kind: existing?.kind ?? 'set',
+        base: existing?.base ?? null,
+        modifiers: [...(existing?.modifiers ?? [])],
+        final: new Set(existing ? (existing.kind === 'set' ? resolve(data.sets, name, rules).ids : []) : captureIds()),
+        change: new Map(existing?.kind === 'modifier'
+            ? [...existing.on.map(id => [id, 'on']), ...existing.off.map(id => [id, 'off'])]
+            : []),
+        from: new Set(),
+        compare: null,
+        compareName: '',
+        show: 'all',
+    };
 
-    const heading = document.createElement('h3');
-    heading.textContent = name ? `Edit "${name}"` : 'New set';
-    content.appendChild(heading);
+    const recomputeFrom = () => {
+        state.from = state.kind === 'set'
+            ? inherited(data.sets, name, { kind: 'set', base: state.base, modifiers: state.modifiers }, rules).ids
+            : new Set();
+    };
+
+    recomputeFrom();
+
+    // ----- layout -----
+    const content = element('div', 'ps-editor');
+    content.appendChild(element('h3', null, name ? `Edit "${name}"` : 'New set'));
 
     let nameInput = null;
 
     if (!name) {
-        nameInput = document.createElement('input');
+        nameInput = element('input', 'text_pole');
         nameInput.type = 'text';
-        nameInput.classList.add('text_pole');
-        nameInput.placeholder = 'Name for the new set';
+        nameInput.placeholder = 'Name';
         content.appendChild(nameInput);
-    }
 
-    const tools = document.createElement('div');
-    tools.classList.add('ps-editor-tools');
+        const kinds = element('div', 'ps-editor-kinds');
 
-    const filter = document.createElement('input');
-    filter.type = 'search';
-    filter.classList.add('text_pole');
-    filter.placeholder = 'Find a prompt';
-
-    const onlyOnLabel = document.createElement('label');
-    onlyOnLabel.classList.add('checkbox_label');
-    const onlyOn = document.createElement('input');
-    onlyOn.type = 'checkbox';
-    const onlyOnText = document.createElement('span');
-    onlyOnText.textContent = 'Only show prompts that are on';
-    onlyOnLabel.append(onlyOn, onlyOnText);
-
-    const total = document.createElement('span');
-    total.classList.add('ps-editor-total');
-
-    tools.append(filter, onlyOnLabel, total);
-    content.appendChild(tools);
-
-    if (exclusions.size) {
-        const hint = document.createElement('div');
-        hint.classList.add('opacity50p');
-        hint.textContent = 'Prompts that only work one at a time (one Vex, one length and so on) switch each other off here too.';
-        content.appendChild(hint);
-    }
-
-    // Group rows under the preset's own section headers when it has them (NemoEngine does).
-    const list = document.createElement('div');
-    list.classList.add('ps-editor-list');
-    const sections = [];
-    let current = null;
-    const hasSections = rows.some(row => SECTION_HEADER.test(row.name));
-
-    for (const row of rows) {
-        if (hasSections && (SECTION_HEADER.test(row.name) || !current)) {
-            const details = document.createElement('details');
-            details.classList.add('ps-editor-section');
-            const summary = document.createElement('summary');
-            const title = document.createElement('span');
-            title.textContent = SECTION_HEADER.test(row.name) ? row.name.replace(/^=+\s*|\s*=+$/g, '') : 'Before the first section';
-            const count = document.createElement('span');
-            count.classList.add('ps-editor-count');
-            summary.append(title, count);
-            const body = document.createElement('div');
-            body.classList.add('ps-editor-body');
-            details.append(summary, body);
-            list.appendChild(details);
-            current = { details, body, count };
-            sections.push(current);
+        for (const [value, label] of [['set', 'Set'], ['modifier', 'Modifier: only changes, stacked onto sets']]) {
+            const option = element('label', 'checkbox_label');
+            const radio = element('input');
+            radio.type = 'radio';
+            radio.name = 'ps_kind';
+            radio.value = value;
+            radio.checked = value === state.kind;
+            radio.addEventListener('change', () => {
+                state.kind = value;
+                state.show = 'all';
+                recomputeFrom();
+                build();
+            });
+            option.append(radio, element('span', null, label));
+            kinds.appendChild(option);
         }
 
-        (current?.body ?? list).appendChild(makeCheckbox(row, start.has(row.id), exclusions.get(row.id)));
+        content.appendChild(kinds);
     }
 
-    content.appendChild(list);
+    const layerBox = element('div', 'ps-editor-layers');
+    const toolBox = element('div', 'ps-editor-tools');
+    const hintBox = element('div', 'opacity50p');
+    const list = element('div', 'ps-editor-list');
+    content.append(layerBox, toolBox, hintBox, list);
 
-    const boxes = () => /** @type {HTMLInputElement[]} */ ([...list.querySelectorAll('input[type="checkbox"]')]);
+    const dependants = name ? allDependants(data.sets, name) : [];
+
+    let sections = [];
+    let rowViews = [];
+    let total = null;
+
+    const groupHint = rules.groupOf.size || rules.withIds.size
+        ? 'Prompts marked as only working one at a time switch each other off here too.'
+        : '';
+
+    function isChanged(view) {
+        return state.kind === 'set'
+            ? state.final.has(view.id) !== state.from.has(view.id)
+            : state.change.has(view.id);
+    }
+
+    function isDifferent(view) {
+        return Boolean(state.compare) && state.final.has(view.id) !== state.compare.has(view.id);
+    }
+
+    function updateRow(view) {
+        if (state.kind === 'set') {
+            view.control.checked = state.final.has(view.id);
+            view.mark.hidden = !(state.base || state.modifiers.length) || !isChanged(view);
+            view.mark.title = state.from.has(view.id)
+                ? 'Switched off here, on in what this set builds on. Click to follow it again.'
+                : 'Switched on here, off in what this set builds on. Click to follow it again.';
+            view.diff.hidden = !isDifferent(view);
+            view.diff.textContent = isDifferent(view) ? (state.compare.has(view.id) ? `on in ${state.compareName}` : `off in ${state.compareName}`) : '';
+        } else {
+            const value = state.change.get(view.id) || '';
+            view.control.textContent = value === 'on' ? 'On' : value === 'off' ? 'Off' : '–';
+            view.control.dataset.state = value;
+        }
+    }
 
     function updateCounts() {
         for (const section of sections) {
-            const inside = [...section.body.querySelectorAll('input[type="checkbox"]')];
-            section.count.textContent = `${inside.filter(box => box.checked).length}/${inside.length}`;
+            const inside = rowViews.filter(view => view.section === section);
+            section.count.textContent = state.kind === 'set'
+                ? `${inside.filter(view => state.final.has(view.id)).length}/${inside.length}`
+                : `${inside.filter(view => state.change.has(view.id)).length} changed`;
         }
 
-        total.textContent = `${boxes().filter(box => box.checked).length} on`;
+        if (state.kind === 'set') {
+            const changed = rowViews.filter(isChanged).length;
+            total.textContent = `${state.final.size} on${state.base || state.modifiers.length ? ` · ${changed} changed here` : ''}`;
+        } else {
+            const values = [...state.change.values()];
+            total.textContent = `${values.filter(v => v === 'on').length} on · ${values.filter(v => v === 'off').length} off`;
+        }
     }
 
-    function updateVisibility() {
-        const query = filter.value.trim().toLowerCase();
+    function updateVisibility(query = '') {
+        const filtering = Boolean(query) || state.show !== 'all';
 
-        for (const box of boxes()) {
-            const label = /** @type {HTMLElement} */ (box.closest('label'));
-            label.hidden = (Boolean(query) && !label.dataset.name.includes(query)) || (onlyOn.checked && !box.checked);
+        for (const view of rowViews) {
+            let visible = !query || view.search.includes(query);
+
+            if (state.show === 'on') {
+                visible &&= state.final.has(view.id);
+            } else if (state.show === 'changed') {
+                visible &&= isChanged(view);
+            } else if (state.show === 'different') {
+                visible &&= isDifferent(view);
+            }
+
+            view.label.hidden = !visible;
         }
 
         for (const section of sections) {
-            const visible = [...section.body.querySelectorAll('label')].some(label => !label.hidden);
+            const visible = rowViews.some(view => view.section === section && !view.label.hidden);
             section.details.hidden = !visible;
 
-            if (query || onlyOn.checked) {
+            if (filtering) {
                 section.details.open = visible;
             }
         }
     }
 
-    list.addEventListener('change', event => {
-        const box = /** @type {HTMLInputElement} */ (event.target);
+    let search = null;
 
-        if (!(box instanceof HTMLInputElement) || !box.checked) {
-            updateCounts();
+    function updateAll() {
+        rowViews.forEach(updateRow);
+        updateCounts();
+        updateVisibility(search?.value.trim().toLowerCase() || '');
+    }
+
+    /** Switch a prompt on in the final state, and off anything it excludes. */
+    function switchOn(id) {
+        for (const other of [...state.final]) {
+            if (other !== id && excludes(rules, id, other)) {
+                state.final.delete(other);
+            }
+        }
+
+        state.final.add(id);
+    }
+
+    function buildLayers() {
+        layerBox.innerHTML = '';
+
+        if (state.kind !== 'set') {
+            if (dependants.length) {
+                layerBox.appendChild(element('div', 'opacity50p', `Used by: ${dependants.join(', ')}.`));
+            }
+
             return;
         }
 
-        const mine = exclusions.get(box.value);
+        const bases = possibleBases(data.sets, name);
+        const baseRow = element('label', 'ps-editor-field');
+        baseRow.appendChild(element('span', null, 'Builds on'));
+        const baseSelect = makeSelect([['', '— Nothing —'], ...bases.sort((a, b) => a.localeCompare(b)).map(item => [item, item])], state.base);
+        baseSelect.addEventListener('change', () => {
+            state.base = baseSelect.value || null;
+            recomputeFrom();
+            updateAll();
+        });
+        baseRow.appendChild(baseSelect);
+        layerBox.appendChild(baseRow);
 
-        for (const other of boxes()) {
-            if (other === box || !other.checked) {
-                continue;
+        if (modifiers.length) {
+            const modRow = element('div', 'ps-editor-field');
+            modRow.appendChild(element('span', null, 'Modifiers'));
+            const chips = element('div', 'ps-chips');
+
+            for (const modName of modifiers) {
+                const chip = element('label', 'checkbox_label ps-chip');
+                const box = element('input');
+                box.type = 'checkbox';
+                box.checked = state.modifiers.includes(modName);
+                box.addEventListener('change', () => {
+                    state.modifiers = modifiers.filter(item => item === modName ? box.checked : state.modifiers.includes(item));
+                    recomputeFrom();
+                    updateAll();
+                });
+                chip.append(box, element('span', null, modName));
+                chips.appendChild(chip);
             }
 
-            const theirs = exclusions.get(other.value);
-            const sameGroup = mine?.group && theirs?.group === mine.group;
-            const named = mine?.withIds.includes(other.value) || theirs?.withIds.includes(box.value);
-
-            if (sameGroup || named) {
-                other.checked = false;
-            }
+            modRow.appendChild(chips);
+            layerBox.appendChild(modRow);
         }
 
-        updateCounts();
-        updateVisibility();
-    });
+        if (dependants.length) {
+            layerBox.appendChild(element('div', 'opacity50p', `Changes here also reach: ${dependants.join(', ')}.`));
+        }
+    }
 
-    filter.addEventListener('input', updateVisibility);
-    onlyOn.addEventListener('change', updateVisibility);
-    updateCounts();
+    function buildTools() {
+        toolBox.innerHTML = '';
+
+        search = element('input', 'text_pole');
+        search.type = 'search';
+        search.placeholder = 'Find a prompt';
+        search.addEventListener('input', () => updateVisibility(search.value.trim().toLowerCase()));
+        toolBox.appendChild(search);
+
+        const showOptions = state.kind === 'set'
+            ? [['all', 'All prompts'], ['on', 'Switched on'], ['changed', 'Changed in this set'], ['different', 'Different from the compared set']]
+            : [['all', 'All prompts'], ['changed', 'Changed by this modifier']];
+        const show = makeSelect(showOptions, state.show);
+        show.title = 'Show';
+        show.addEventListener('change', () => {
+            state.show = show.value;
+            updateVisibility(search.value.trim().toLowerCase());
+        });
+        toolBox.appendChild(show);
+
+        if (state.kind === 'set') {
+            const others = setNames(data, 'set').filter(item => item !== name);
+            const compare = makeSelect([['', 'Compare with…'], ...others.map(item => [item, item])], state.compareName);
+            compare.addEventListener('change', () => {
+                state.compareName = compare.value;
+                state.compare = compare.value ? resolve(data.sets, compare.value, rules).ids : null;
+
+                if (state.compare && state.show === 'all') {
+                    state.show = 'different';
+                    show.value = 'different';
+                }
+
+                updateAll();
+            });
+            toolBox.appendChild(compare);
+
+            const reset = element('div', 'menu_button', 'Follow all');
+            reset.title = 'Undo every change made in this set, so it switches on exactly what it builds on';
+            reset.addEventListener('click', () => {
+                state.final = new Set(state.from);
+                updateAll();
+            });
+            toolBox.appendChild(reset);
+        }
+
+        total = element('span', 'ps-editor-total');
+        toolBox.appendChild(total);
+    }
+
+    function buildList() {
+        list.innerHTML = '';
+        sections = [];
+        rowViews = [];
+
+        const hasSections = rows.some(row => SECTION_HEADER.test(row.name));
+        let current = null;
+
+        for (const row of rows) {
+            if (hasSections && (SECTION_HEADER.test(row.name) || !current)) {
+                const details = element('details', 'ps-editor-section');
+                const summary = element('summary');
+                const title = SECTION_HEADER.test(row.name) ? row.name.replace(/^=+\s*|\s*=+$/g, '') : 'Before the first section';
+                const count = element('span', 'ps-editor-count');
+                summary.append(element('span', null, title), count);
+                const body = element('div', 'ps-editor-body');
+                details.append(summary, body);
+                list.appendChild(details);
+                current = { details, body, count };
+                sections.push(current);
+            }
+
+            const label = element('label', 'checkbox_label ps-editor-row');
+
+            if (SUB_HEADER.test(row.name)) {
+                label.classList.add('ps-editor-sub');
+            }
+
+            const view = { id: row.id, label, section: current, search: row.name.toLowerCase() };
+
+            if (state.kind === 'set') {
+                view.control = element('input');
+                view.control.type = 'checkbox';
+                view.control.addEventListener('change', () => {
+                    if (view.control.checked) {
+                        switchOn(row.id);
+                    } else {
+                        state.final.delete(row.id);
+                    }
+
+                    updateAll();
+                });
+
+                view.mark = element('span', 'ps-mark fa-solid fa-circle');
+                view.mark.addEventListener('click', event => {
+                    event.preventDefault();
+
+                    if (state.from.has(row.id)) {
+                        switchOn(row.id);
+                    } else {
+                        state.final.delete(row.id);
+                    }
+
+                    updateAll();
+                });
+
+                view.diff = element('span', 'ps-diff');
+                label.append(view.control, element('span', null, row.name), view.mark, view.diff);
+            } else {
+                view.control = element('div', 'menu_button ps-tri');
+                view.control.title = 'Click to cycle: leave alone, switch on, switch off';
+                view.control.addEventListener('click', event => {
+                    event.preventDefault();
+                    const next = { '': 'on', on: 'off', off: '' }[state.change.get(row.id) || ''];
+
+                    if (next) {
+                        state.change.set(row.id, next);
+                    } else {
+                        state.change.delete(row.id);
+                    }
+
+                    if (next === 'on') {
+                        for (const [other, value] of [...state.change]) {
+                            if (other !== row.id && value === 'on' && excludes(rules, row.id, other)) {
+                                state.change.delete(other);
+                            }
+                        }
+                    }
+
+                    updateAll();
+                });
+
+                label.append(view.control, element('span', null, row.name));
+            }
+
+            (current?.body ?? list).appendChild(label);
+            rowViews.push(view);
+        }
+    }
+
+    function build() {
+        buildLayers();
+        buildTools();
+        hintBox.textContent = state.kind === 'set'
+            ? [groupHint, state.base || state.modifiers.length ? 'A dot marks a prompt changed in this set; click it to follow the base again.' : ''].filter(Boolean).join(' ')
+            : [groupHint, 'Changes apply to every set that uses this modifier, on top of its base.'].filter(Boolean).join(' ');
+        buildList();
+        updateAll();
+    }
+
+    build();
 
     let finalName = name;
 
@@ -871,12 +1606,12 @@ async function editSet(name = null) {
             finalName = cleanName(nameInput.value);
 
             if (!finalName) {
-                toastr.warning('Give the set a name.', 'Preset Sets');
+                toastr.warning('Give it a name.', 'Preset Sets');
                 return false;
             }
 
             if (data.sets[finalName]) {
-                toastr.warning(`A set called "${finalName}" already exists.`, 'Preset Sets');
+                toastr.warning(`"${finalName}" already exists.`, 'Preset Sets');
                 return false;
             }
 
@@ -886,31 +1621,37 @@ async function editSet(name = null) {
 
     await popup.show();
 
-    if (popup.result !== POPUP_RESULT.AFFIRMATIVE || !finalName) {
+    if (popup.result !== POPUP_RESULT.AFFIRMATIVE || !finalName || currentPresetName() !== preset) {
         return null;
     }
 
-    // Saved in prompt order. Prompts the preset no longer has are dropped, as Update does.
-    const ids = boxes().filter(box => box.checked).map(box => box.value);
-    data.sets[finalName] = { ids, updated: new Date().toISOString() };
-    warnedMissing.delete(`${preset}\u0000${finalName}`);
-    saveSettingsDebounced();
-    toastr.success(`Saved "${finalName}" with ${ids.length} prompt(s) on.`, 'Preset Sets');
+    // Prompts the preset no longer has are dropped, as Update does.
+    const present = new Set(rows.map(row => row.id));
+    const updated = new Date().toISOString();
 
-    // An edit to the set in use takes effect straight away.
-    const inUse = (lastApplied?.preset === preset && lastApplied.name === finalName) || targetFor()?.name === finalName;
-
-    if (inUse && currentPresetName() === preset) {
-        await serial(async () => {
-            const result = await applyIds(ids);
-            lastApplied = { preset, name: finalName, source: 'edit', persona: user_avatar, ...result };
-            reportApply(finalName, result, true);
-        });
+    if (state.kind === 'set') {
+        const { on, off } = changesBetween(state.from, [...state.final].filter(id => present.has(id)), rules, order);
+        data.sets[finalName] = { kind: 'set', base: state.base, modifiers: [...state.modifiers], on, off, updated };
+    } else {
+        const pick = (value) => order.filter(id => state.change.get(id) === value);
+        data.sets[finalName] = { kind: 'modifier', base: null, modifiers: [], on: pick('on'), off: pick('off'), updated };
     }
 
+    ensureKnown(data);
+    warnedMissing.delete(`${preset}\u0000${finalName}`);
+    saveSettingsDebounced();
+
+    const reach = allDependants(data.sets, finalName);
+    toastr.success(`Saved "${finalName}".${reach.length ? ` ${plural(reach.length, 'set')} built on it follow${reach.length === 1 ? 's' : ''} the change.` : ''}`, 'Preset Sets');
+
+    await reapplyInUse();
     refreshUI(finalName);
     return finalName;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Export and import
+// ---------------------------------------------------------------------------------------------
 
 function exportSets() {
     const preset = currentPresetName();
@@ -921,11 +1662,27 @@ function exportSets() {
         return;
     }
 
-    const links = {};
+    const settings = getSettings();
+    const links = { persona: {}, card: {}, pair: {} };
 
-    for (const [avatar, byPreset] of Object.entries(getSettings().links)) {
+    for (const [avatar, byPreset] of Object.entries(settings.links)) {
         if (byPreset?.[preset]) {
-            links[avatar] = byPreset[preset];
+            links.persona[avatar] = byPreset[preset];
+        }
+    }
+
+    for (const [card, byPreset] of Object.entries(settings.cardLinks)) {
+        if (byPreset?.[preset]) {
+            links.card[card] = byPreset[preset];
+        }
+    }
+
+    for (const [avatar, byCard] of Object.entries(settings.pairLinks)) {
+        for (const [card, byPreset] of Object.entries(byCard || {})) {
+            if (byPreset?.[preset]) {
+                links.pair[avatar] ??= {};
+                links.pair[avatar][card] = byPreset[preset];
+            }
         }
     }
 
@@ -935,6 +1692,7 @@ function exportSets() {
         preset,
         sets: data.sets,
         defaultSet: data.defaultSet,
+        known: data.known,
         links,
     };
 
@@ -967,57 +1725,108 @@ async function importSets(file) {
     const data = presetData(preset, true);
     let count = 0;
 
-    for (const [name, set] of Object.entries(payload.sets)) {
+    for (const [name, raw] of Object.entries(payload.sets)) {
         const clean = cleanName(name);
+        const set = normaliseSet(raw);
 
-        if (!clean || !Array.isArray(set?.ids) || !set.ids.every(id => typeof id === 'string')) {
-            continue;
+        if (clean && set) {
+            data.sets[clean] = set;
+            count++;
         }
-
-        data.sets[clean] = { ids: [...set.ids], updated: typeof set.updated === 'string' ? set.updated : new Date().toISOString() };
-        count++;
     }
 
-    if (typeof payload.defaultSet === 'string' && data.sets[payload.defaultSet]) {
+    if (typeof payload.defaultSet === 'string' && data.sets[payload.defaultSet]?.kind === 'set') {
         data.defaultSet = payload.defaultSet;
     }
 
-    if (payload.links && typeof payload.links === 'object') {
-        for (const [avatar, name] of Object.entries(payload.links)) {
-            if (typeof name === 'string' && data.sets[name]) {
-                setLink(avatar, preset, name);
+    if (Array.isArray(payload.known)) {
+        data.known = payload.known.filter(id => typeof id === 'string');
+    }
+
+    const usable = (name) => typeof name === 'string' && data.sets[name]?.kind === 'set';
+    const links = payload.links || {};
+
+    // Version 1 files held persona links directly: { avatar: setName }.
+    const personaLinks = payload.version >= 2 ? links.persona : links;
+
+    for (const [avatar, name] of Object.entries(personaLinks || {})) {
+        if (usable(name)) {
+            setLink('persona', name, preset, avatar, null);
+        }
+    }
+
+    if (payload.version >= 2) {
+        for (const [card, name] of Object.entries(links.card || {})) {
+            if (usable(name)) {
+                setLink('card', name, preset, null, card);
+            }
+        }
+
+        for (const [avatar, byCard] of Object.entries(links.pair || {})) {
+            for (const [card, name] of Object.entries(byCard || {})) {
+                if (usable(name)) {
+                    setLink('pair', name, preset, avatar, card);
+                }
             }
         }
     }
 
+    await refreshRules();
+    ensureKnown(data);
     saveSettingsDebounced();
+
+    const problems = checkAll(data.sets, rulesFor(data));
+    toastr.success(`Imported ${plural(count, 'set')} into "${preset}".`, 'Preset Sets');
+
+    if (problems.length) {
+        toastr.warning(problems.slice(0, 3).join(' '), 'Preset Sets');
+    }
+
     refreshUI();
-    toastr.success(`Imported ${count} set(s) into "${preset}".`, 'Preset Sets');
     await autoApply();
+    await checkNewPrompts();
 }
 
 // ---------------------------------------------------------------------------------------------
 // Settings panel
 // ---------------------------------------------------------------------------------------------
 
-function fillSelect(select, names, value, emptyLabel) {
+/** Fill a select with sets, and optionally modifiers in their own group. */
+function fillSetSelect(select, data, value, { emptyLabel, withModifiers = false, mark = null } = {}) {
     select.innerHTML = '';
 
+    const add = (parent, optionValue, label) => {
+        const option = element('option', null, label);
+        option.value = optionValue;
+        parent.appendChild(option);
+    };
+
     if (emptyLabel !== undefined) {
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = emptyLabel;
-        select.appendChild(option);
+        add(select, '', emptyLabel);
     }
 
-    for (const name of names) {
-        const option = document.createElement('option');
-        option.value = name;
-        option.textContent = name;
-        select.appendChild(option);
+    const sets = setNames(data, 'set');
+    const mods = withModifiers ? setNames(data, 'modifier') : [];
+
+    if (mods.length) {
+        const setGroup = element('optgroup');
+        setGroup.label = 'Sets';
+        sets.forEach(name => add(setGroup, name, name === mark ? `${name} (active)` : name));
+        const modGroup = element('optgroup');
+        modGroup.label = 'Modifiers';
+        mods.forEach(name => add(modGroup, name, name));
+        select.append(setGroup, modGroup);
+    } else {
+        sets.forEach(name => add(select, name, name === mark ? `${name} (active)` : name));
     }
 
-    select.value = names.includes(value) ? value : (emptyLabel !== undefined ? '' : (names[0] ?? ''));
+    const all = [...sets, ...mods];
+
+    if (!all.length && emptyLabel === undefined) {
+        add(select, '', 'No sets in this preset yet');
+    }
+
+    select.value = all.includes(value) ? value : (emptyLabel !== undefined ? '' : (all[0] ?? ''));
 }
 
 function describeState() {
@@ -1028,21 +1837,19 @@ function describeState() {
     const target = targetFor();
     const parts = [];
 
-    if (target?.brokenLink) {
-        parts.push(`${personaName()} is linked to "${target.brokenLink}", which no longer exists.`);
+    if (target?.broken?.length) {
+        parts.push(`Linked to ${target.broken.map(name => `"${name}"`).join(', ')}, which no longer exist${target.broken.length === 1 ? 's' : ''}.`);
     }
 
-    if (!target?.set) {
-        parts.push('No set applies to this persona in this preset, so the preset\'s own toggles are in use.');
-        return parts.join(' ');
-    }
+    if (!target?.name) {
+        parts.push('No set applies here, so the preset\'s own toggles are in use.');
+    } else {
+        const pending = planApply(setIds(target.name)).changes.length;
+        parts.push(`Active set: "${target.name}" (${sourceText(target.source)}). ${pending ? `${plural(pending, 'prompt')} currently differ from it.` : 'The toggles match it.'}`);
 
-    const from = target.source === 'persona' ? `linked to ${personaName()}` : 'the set for unlinked personas';
-    const pending = planApply(target.set.ids).changes.length;
-    parts.push(`Active set: "${target.name}" (${from}). ${pending ? `${pending} prompt(s) currently differ from it.` : 'The toggles match it.'}`);
-
-    if (lastApplied?.missing?.length && lastApplied.name === target.name && lastApplied.preset === currentPresetName()) {
-        parts.push(`It lists ${lastApplied.missing.length} prompt(s) this preset no longer has.`);
+        if (lastApplied?.missing?.length && lastApplied.name === target.name && lastApplied.preset === currentPresetName()) {
+            parts.push(`It lists ${plural(lastApplied.missing.length, 'prompt')} this preset no longer has.`);
+        }
     }
 
     if (isLocked()) {
@@ -1068,29 +1875,36 @@ function refreshPanel(selectName) {
     const settings = getSettings();
     const preset = currentPresetName();
     const data = presetData();
-    const names = setNames(data);
-
+    const card = currentCard();
     const setSelect = /** @type {HTMLSelectElement} */ (document.getElementById('ps_set'));
-    const linkSelect = /** @type {HTMLSelectElement} */ (document.getElementById('ps_link'));
-    const defaultSelect = /** @type {HTMLSelectElement} */ (document.getElementById('ps_default'));
 
-    fillSelect(setSelect, names, selectName ?? setSelect.value);
-    fillSelect(linkSelect, names, settings.links?.[user_avatar]?.[preset] ?? '', '— No link —');
-    fillSelect(defaultSelect, names, data?.defaultSet ?? '', '— None: keep the preset\'s toggles —');
+    fillSetSelect(setSelect, data, selectName ?? setSelect.value, { withModifiers: true });
+    fillSetSelect(document.getElementById('ps_link'), data, getLink('persona'), { emptyLabel: '— No link —' });
+    fillSetSelect(document.getElementById('ps_card_link'), data, getLink('card'), { emptyLabel: card ? '— No link —' : '— Open a chat first —' });
+    fillSetSelect(document.getElementById('ps_pair_link'), data, getLink('pair'), { emptyLabel: card ? '— No link —' : '— Open a chat first —' });
+    fillSetSelect(document.getElementById('ps_default'), data, data?.defaultSet ?? '', { emptyLabel: '— None: keep the preset\'s toggles —' });
 
+    document.getElementById('ps_card_link').toggleAttribute('disabled', !card);
+    document.getElementById('ps_pair_link').toggleAttribute('disabled', !card);
     document.getElementById('ps_preset_name').textContent = preset || 'none';
-    document.getElementById('ps_persona_name').textContent = personaName();
-    /** @type {HTMLInputElement} */ (document.getElementById('ps_lock')).checked = Boolean(data?.locked);
-    document.getElementById('ps_lock').toggleAttribute('disabled', !preset);
+    document.querySelectorAll('.ps_persona_name').forEach(node => { node.textContent = personaName(); });
+    document.querySelectorAll('.ps_card_name').forEach(node => { node.textContent = card?.name || 'this card'; });
     document.getElementById('ps_status').textContent = describeState();
 
     /** @type {HTMLInputElement} */ (document.getElementById('ps_auto')).checked = settings.autoApply;
     /** @type {HTMLInputElement} */ (document.getElementById('ps_notify')).checked = settings.notify;
+    /** @type {HTMLInputElement} */ (document.getElementById('ps_lock')).checked = Boolean(data?.locked);
+    document.getElementById('ps_lock').toggleAttribute('disabled', !preset);
 
-    const hasSet = names.length > 0;
+    const chosen = setSelect.value;
+    const isSet = data?.sets[chosen]?.kind === 'set';
 
-    for (const id of ['ps_apply', 'ps_edit', 'ps_update', 'ps_rename', 'ps_delete']) {
-        document.getElementById(id).classList.toggle('disabled', !hasSet);
+    for (const id of ['ps_edit', 'ps_rename', 'ps_delete']) {
+        document.getElementById(id).classList.toggle('disabled', !chosen);
+    }
+
+    for (const id of ['ps_apply', 'ps_update']) {
+        document.getElementById(id).classList.toggle('disabled', !isSet);
     }
 }
 
@@ -1104,21 +1918,26 @@ function addSettingsPanel() {
             </div>
             <div class="inline-drawer-content">
                 <div class="ps-context">Preset: <b id="ps_preset_name"></b></div>
-                <label for="ps_set">Sets in this preset</label>
+                <label for="ps_set">Sets and modifiers in this preset</label>
                 <select id="ps_set" class="text_pole"></select>
                 <div class="ps-buttons">
                     <div id="ps_apply" class="menu_button" title="Switch prompts to match this set">Apply</div>
-                    <div id="ps_edit" class="menu_button" title="Choose which prompts this set switches on">Edit…</div>
-                    <div id="ps_save_new" class="menu_button" title="Save the prompts switched on now as a new set">Save as new…</div>
-                    <div id="ps_update" class="menu_button" title="Replace this set with the prompts switched on now">Update</div>
+                    <div id="ps_edit" class="menu_button" title="Choose what this set or modifier switches on and off">Edit…</div>
+                    <div id="ps_new" class="menu_button" title="Make a new set or modifier, starting from the prompts switched on now">New…</div>
+                    <div id="ps_update" class="menu_button" title="Make this set switch on exactly the prompts that are on now">Update</div>
                     <div id="ps_rename" class="menu_button">Rename…</div>
                     <div id="ps_delete" class="menu_button redWarningBG">Delete</div>
                 </div>
-                <label for="ps_link">Set for <b id="ps_persona_name"></b> in this preset</label>
+                <label for="ps_link">Set for <b class="ps_persona_name"></b></label>
                 <select id="ps_link" class="text_pole"></select>
-                <label for="ps_default">Set for personas with no link</label>
+                <label for="ps_card_link">Set for <b class="ps_card_name"></b></label>
+                <select id="ps_card_link" class="text_pole"></select>
+                <label for="ps_pair_link">Set for <b class="ps_persona_name"></b> with <b class="ps_card_name"></b></label>
+                <select id="ps_pair_link" class="text_pole"></select>
+                <label for="ps_default">Set for anything without a link</label>
                 <select id="ps_default" class="text_pole"></select>
-                <label class="checkbox_label" for="ps_lock" title="Prompts can only be switched through sets, and the preset can't be updated, renamed or deleted">
+                <div class="opacity50p">The most specific link wins: persona with card, then persona, then card.</div>
+                <label class="checkbox_label marginTop10" for="ps_lock" title="Prompts can only be switched through sets, and the preset can't be updated, renamed or deleted">
                     <input id="ps_lock" type="checkbox">
                     <span>Lock this preset</span>
                 </label>
@@ -1149,12 +1968,13 @@ function addSettingsPanel() {
 
     const selected = () => /** @type {HTMLSelectElement} */ (document.getElementById('ps_set')).value;
 
+    $('#ps_set').on('change', () => refreshPanel(selected()));
     $('#ps_apply').on('click', () => selected() && applyNamed(selected()));
-    $('#ps_save_new').on('click', () => saveCurrentAsNew());
+    $('#ps_edit').on('click', () => selected() && editSet(selected()));
+    $('#ps_new').on('click', () => editSet(null));
     $('#ps_update').on('click', () => selected() && updateSelected(selected()));
     $('#ps_rename').on('click', () => selected() && renameSelected(selected()));
     $('#ps_delete').on('click', () => selected() && deleteSelected(selected()));
-    $('#ps_edit').on('click', () => selected() && editSet(selected()));
     $('#ps_lock').on('change', event => setLocked(/** @type {HTMLInputElement} */ (event.target).checked));
     $('#ps_export').on('click', () => exportSets());
     $('#ps_import').on('click', () => document.getElementById('ps_import_file').click());
@@ -1169,11 +1989,15 @@ function addSettingsPanel() {
         }
     });
 
-    $('#ps_link').on('change', async event => {
-        setLink(user_avatar, currentPresetName(), /** @type {HTMLSelectElement} */ (event.target).value || null);
+    const linkSelect = (id, kind) => $(id).on('change', async event => {
+        setLink(kind, /** @type {HTMLSelectElement} */ (event.target).value || null);
         refreshUI();
         await autoApply();
     });
+
+    linkSelect('#ps_link', 'persona');
+    linkSelect('#ps_card_link', 'card');
+    linkSelect('#ps_pair_link', 'pair');
 
     $('#ps_default').on('change', async event => {
         const data = presetData(currentPresetName(), true);
@@ -1209,7 +2033,7 @@ function addSettingsPanel() {
 // Bar in the Chat Completion presets section
 // ---------------------------------------------------------------------------------------------
 
-/** Preset, persona and active set the bar last showed, so it follows the active set when they change. */
+/** Preset, persona, card and active set the bar last showed, so it follows the active set when they change. */
 let barContext = null;
 let barRefreshTimer = null;
 
@@ -1218,20 +2042,17 @@ function shortStatus(target) {
         return '';
     }
 
-    const persona = personaName();
+    const parts = [];
 
-    if (!target?.set) {
-        const text = target?.brokenLink
-            ? `${persona} is linked to "${target.brokenLink}", which no longer exists. The preset's own toggles are in use.`
-            : `No set for ${persona} here. The preset's own toggles are in use.`;
-        return isLocked() ? `${text} · locked` : text;
+    if (!target?.name) {
+        parts.push(target?.broken?.length
+            ? `Linked set "${target.broken[0]}" no longer exists. The preset's own toggles are in use`
+            : 'No set applies here. The preset\'s own toggles are in use');
+    } else {
+        const pending = planApply(setIds(target.name)).changes.length;
+        parts.push(`"${target.name}" (${sourceText(target.source)})`);
+        parts.push(pending ? `${plural(pending, 'prompt')} ${pending === 1 ? 'differs' : 'differ'}` : 'toggles match');
     }
-
-    const pending = planApply(target.set.ids).changes.length;
-    const parts = [
-        `${persona}: "${target.name}" (${target.source === 'persona' ? 'linked' : 'for unlinked personas'})`,
-        pending ? `${pending} prompt${pending === 1 ? ' differs' : 's differ'}` : 'toggles match',
-    ];
 
     if (!getSettings().autoApply) {
         parts.push('automatic applying is off');
@@ -1252,44 +2073,29 @@ function refreshBar(selectName) {
     }
 
     const preset = currentPresetName();
-    const names = setNames();
+    const data = presetData();
     const target = isReady() ? targetFor() : null;
-    const linked = getSettings().links?.[user_avatar]?.[preset] ?? null;
-    const context = `${preset}\u0000${user_avatar}\u0000${target?.name ?? ''}`;
+    const card = currentCard();
+    const context = `${preset}\u0000${user_avatar}\u0000${card?.key ?? ''}\u0000${target?.name ?? ''}`;
 
-    // Keep the user's choice while they work; show the active set again when the preset, persona
-    // or active set changes.
+    // Keep the user's choice while they work; show the active set again when the preset, persona,
+    // card or active set changes.
     const wanted = selectName ?? (context !== barContext ? target?.name : select.value);
     barContext = context;
 
-    select.innerHTML = '';
-
-    if (!names.length) {
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = 'No sets in this preset yet';
-        select.appendChild(option);
-    }
-
-    for (const name of names) {
-        const option = document.createElement('option');
-        option.value = name;
-        option.textContent = name === target?.name ? `${name} (active)` : name;
-        select.appendChild(option);
-    }
-
-    select.value = names.includes(wanted) ? wanted : (names[0] ?? '');
+    fillSetSelect(select, data, wanted, { withModifiers: true, mark: target?.name });
 
     const chosen = select.value;
-    const isLinked = Boolean(chosen) && chosen === linked;
+    const isSet = data?.sets[chosen]?.kind === 'set';
+    const linkedHere = isSet && ['pair', 'persona', 'card'].some(kind => getLink(kind) === chosen);
     const link = document.getElementById('ps_bar_link');
-    link.classList.toggle('ps-on', isLinked);
-    link.title = isLinked
-        ? `Unlink "${chosen}" from ${personaName()}`
-        : `Link this set to ${personaName()} in this preset`;
+    link.classList.toggle('ps-on', linkedHere);
+    link.title = `Choose where "${chosen || 'this set'}" is used: this persona, this card, or both together`;
 
-    for (const id of ['ps_bar_apply', 'ps_bar_edit', 'ps_bar_update', 'ps_bar_link']) {
-        document.getElementById(id).classList.toggle('disabled', !chosen);
+    document.getElementById('ps_bar_edit').classList.toggle('disabled', !chosen);
+
+    for (const id of ['ps_bar_apply', 'ps_bar_update', 'ps_bar_link']) {
+        document.getElementById(id).classList.toggle('disabled', !isSet);
     }
 
     const locked = isLocked();
@@ -1326,19 +2132,19 @@ function addPresetBar() {
     <div id="ps_bar" class="ps-bar">
         <div class="flex-container flexNoGap alignItemsCenter">
             <i class="ps-bar-icon fa-fw fa-solid fa-layer-group" title="Preset Sets. More options are under Extensions → Preset Sets."></i>
-            <select id="ps_bar_set" class="flex1 text_pole" title="Sets in this preset"></select>
+            <select id="ps_bar_set" class="flex1 text_pole" title="Sets and modifiers in this preset"></select>
         </div>
         <div class="flex-container gap3px ps-bar-buttons">
             <div id="ps_bar_apply" class="menu_button menu_button_icon" title="Apply this set">
                 <i class="fa-fw fa-solid fa-check"></i>
             </div>
-            <div id="ps_bar_edit" class="menu_button menu_button_icon" title="Choose which prompts this set switches on">
+            <div id="ps_bar_edit" class="menu_button menu_button_icon" title="Choose what this set or modifier switches on and off">
                 <i class="fa-fw fa-solid fa-pen-to-square"></i>
             </div>
-            <div id="ps_bar_update" class="menu_button menu_button_icon" title="Update this set with the prompts switched on now">
+            <div id="ps_bar_update" class="menu_button menu_button_icon" title="Make this set switch on exactly the prompts that are on now">
                 <i class="fa-fw fa-solid fa-arrows-rotate"></i>
             </div>
-            <div id="ps_bar_new" class="menu_button menu_button_icon" title="New set, starting from the prompts switched on now">
+            <div id="ps_bar_new" class="menu_button menu_button_icon" title="New set or modifier, starting from the prompts switched on now">
                 <i class="fa-fw fa-solid fa-plus"></i>
             </div>
             <div id="ps_bar_link" class="menu_button menu_button_icon">
@@ -1360,21 +2166,8 @@ function addPresetBar() {
     $('#ps_bar_edit').on('click', () => chosen() && editSet(chosen()));
     $('#ps_bar_update').on('click', () => chosen() && updateSelected(chosen()));
     $('#ps_bar_new').on('click', () => editSet(null));
+    $('#ps_bar_link').on('click', () => chosen() && chooseLinks(chosen()));
     $('#ps_bar_lock').on('click', () => currentPresetName() && setLocked(!isLocked()));
-
-    $('#ps_bar_link').on('click', async () => {
-        const name = chosen();
-        const preset = currentPresetName();
-
-        if (!name || !preset) {
-            return;
-        }
-
-        const linked = getSettings().links?.[user_avatar]?.[preset];
-        setLink(user_avatar, preset, linked === name ? null : name);
-        refreshUI(name);
-        await autoApply();
-    });
 
     // Capture phase, so the prompt manager (or NemoPresetExt's version of it) can't swallow the event.
     for (const type of ['click', 'change']) {
@@ -1399,7 +2192,7 @@ function registerSlashCommands() {
             const name = cleanName(value);
 
             if (!name) {
-                return setNames().join('\n');
+                return setNames(presetData(), 'set').join('\n');
             }
 
             await applyNamed(name);
@@ -1421,15 +2214,15 @@ function registerSlashCommands() {
             const name = cleanName(value);
 
             if (!name) {
-                toastr.warning('Give the set a name, e.g. /presetset-save DC: Street', 'Preset Sets');
+                toastr.warning('Give the set a name, e.g. /presetset-save Evening', 'Preset Sets');
                 return '';
             }
 
-            return (await saveCurrentAsNew(name)) || '';
+            return (await saveFromToggles(name)) || '';
         },
         unnamedArgumentList: [
             SlashCommandArgument.fromProps({
-                description: 'name for the set; an existing set with this name is replaced',
+                description: 'name for the set; an existing set keeps what it builds on and takes the prompts switched on now',
                 typeList: [ARGUMENT_TYPE.STRING],
                 isRequired: true,
             }),
@@ -1439,29 +2232,90 @@ function registerSlashCommands() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Start-up
+// Start-up and events
 // ---------------------------------------------------------------------------------------------
+
+let loadSeq = 0;
+
+/** A preset was loaded or reloaded: read its markers, apply the linked set, offer new prompts. */
+async function onPresetLoaded() {
+    const seq = ++loadSeq;
+    lastApplied = null;
+    installLockHook();
+
+    try {
+        await refreshRules();
+    } catch (error) {
+        console.warn(LOG, 'Could not read the prompts\' exclusivity markers', error);
+    }
+
+    if (seq !== loadSeq) {
+        return;
+    }
+
+    await autoApply();
+
+    if (seq === loadSeq) {
+        await checkNewPrompts();
+    }
+}
 
 function onPersonaDeleted(avatar) {
     const settings = getSettings();
 
-    if (avatar && settings.links[avatar]) {
+    if (avatar) {
         delete settings.links[avatar];
+        delete settings.pairLinks[avatar];
         saveSettingsDebounced();
     }
 
     refreshUI();
 }
 
+function onCharacterDeleted(event) {
+    const key = event?.character?.avatar;
+
+    if (!key) {
+        return;
+    }
+
+    const settings = getSettings();
+    delete settings.cardLinks[key];
+    Object.values(settings.pairLinks).forEach(byCard => { delete byCard?.[key]; });
+    saveSettingsDebounced();
+    refreshUI();
+}
+
+function onCharacterRenamed(oldAvatar, newAvatar) {
+    if (!oldAvatar || !newAvatar || oldAvatar === newAvatar) {
+        return;
+    }
+
+    const settings = getSettings();
+    const move = (record) => {
+        if (record?.[oldAvatar]) {
+            record[newAvatar] = record[oldAvatar];
+            delete record[oldAvatar];
+        }
+    };
+
+    move(settings.cardLinks);
+    Object.values(settings.pairLinks).forEach(move);
+    saveSettingsDebounced();
+}
+
 /** A console handle for checking what the extension sees. Read-only apart from `apply`. */
 globalThis.PresetSets = {
     get preset() { return currentPresetName(); },
     get persona() { return user_avatar; },
+    get card() { return currentCard(); },
     target: () => targetFor(),
+    ids: (name) => setIds(name ?? targetFor()?.name),
     plan: (name) => {
-        const set = name ? presetData()?.sets[name] : targetFor()?.set;
-        return set && isReady() ? planApply(set.ids) : null;
+        const ids = setIds(name ?? targetFor()?.name);
+        return ids && isReady() ? planApply(ids) : null;
     },
+    problems: () => checkAll(presetData()?.sets || {}, rulesFor()),
     apply: (name) => applyNamed(name),
 };
 
@@ -1473,27 +2327,24 @@ jQuery(async () => {
     blockLockedButtons();
     installLockHook();
 
-    eventSource.on(event_types.APP_READY, () => {
-        installLockHook();
-        return autoApply();
-    });
+    eventSource.on(event_types.APP_READY, () => onPresetLoaded());
     eventSource.on(event_types.PERSONA_CHANGED, () => autoApply());
     eventSource.on(event_types.CHAT_CHANGED, () => autoApply());
 
-    // Switching presets reloads its saved toggles, so the persona's set for that preset is applied
-    // again once the prompt manager has the new preset.
-    // The newly loaded toggles are the preset's own until a set is applied, which is what a locked
-    // preset holds to if no set applies.
-    eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => {
-        lastApplied = null;
-        setTimeout(() => autoApply(), 0);
-    });
+    // Switching presets reloads its saved toggles, so the linked set is applied again once the
+    // prompt manager has the new preset.
+    eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => setTimeout(() => onPresetLoaded(), 0));
 
-    if (event_types.PRESET_RENAMED) {
-        eventSource.on(event_types.PRESET_RENAMED, onPresetRenamed);
-    }
+    const optional = [
+        [event_types.PRESET_RENAMED, onPresetRenamed],
+        [event_types.PERSONA_DELETED, onPersonaDeleted],
+        [event_types.CHARACTER_DELETED, onCharacterDeleted],
+        [event_types.CHARACTER_RENAMED, onCharacterRenamed],
+    ];
 
-    if (event_types.PERSONA_DELETED) {
-        eventSource.on(event_types.PERSONA_DELETED, onPersonaDeleted);
+    for (const [type, handler] of optional) {
+        if (type) {
+            eventSource.on(type, handler);
+        }
     }
 });
