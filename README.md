@@ -51,8 +51,9 @@ them.
 
 ## The bar under the preset list
 
-The list shows the sets and modifiers in this preset, with the set in use marked "(active)". The
-buttons are:
+The list shows the sets and modifiers in this preset. Each set shows what it's built from, such
+as `Base › Fantasy › Fantasy: Romance + [Romance]`, and the list is sorted the same way, so it reads
+like the tree. The set in use is marked with ●. The buttons are:
 
 - ✓ **Apply**: apply the chosen set.
 - ✎ **Edit**: change the chosen set or modifier (see below).

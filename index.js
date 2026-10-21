@@ -1891,28 +1891,57 @@ function fillSetSelect(select, data, value, { emptyLabel, withModifiers = false,
         add(select, '', emptyLabel);
     }
 
-    const sets = setNames(data, 'set');
+    // Sets read as their chain (Base › DC › DC: Mei + [Mei]) and sort by it, so the list reads
+    // like the tree. The active set is marked at the front, where a narrow box won't cut it off.
+    const sets = setNames(data, 'set')
+        .map(name => ({ name, chain: setChain(data, name) }))
+        .sort((a, b) => a.chain.key.localeCompare(b.chain.key));
     const mods = withModifiers ? setNames(data, 'modifier') : [];
+    const label = ({ name, chain }) => `${name === mark ? '● ' : ''}${chain.label}`;
+    const modLabel = (name) => {
+        const users = directDependants(data.sets, name).length;
+        return `[${name}] modifier${users ? ` · used by ${users}` : ''}`;
+    };
 
     if (mods.length) {
         const setGroup = element('optgroup');
         setGroup.label = 'Sets';
-        sets.forEach(name => add(setGroup, name, name === mark ? `${name} (active)` : name));
+        sets.forEach(item => add(setGroup, item.name, label(item)));
         const modGroup = element('optgroup');
         modGroup.label = 'Modifiers';
-        mods.forEach(name => add(modGroup, name, name));
+        mods.forEach(name => add(modGroup, name, modLabel(name)));
         select.append(setGroup, modGroup);
     } else {
-        sets.forEach(name => add(select, name, name === mark ? `${name} (active)` : name));
+        sets.forEach(item => add(select, item.name, label(item)));
     }
 
-    const all = [...sets, ...mods];
+    const all = [...sets.map(item => item.name), ...mods];
 
     if (!all.length && emptyLabel === undefined) {
         add(select, '', 'No sets in this preset yet');
     }
 
     select.value = all.includes(value) ? value : (emptyLabel !== undefined ? '' : (all[0] ?? ''));
+    select.title = select.selectedOptions[0]?.textContent || '';
+}
+
+/**
+ * What a set is built from, as a label and a sort key: its bases from the bottom up, then the set,
+ * then its modifiers in brackets, e.g. "Base › DC › DC: Mei + [Mei]".
+ */
+function setChain(data, name) {
+    const path = [name];
+    const seen = new Set(path);
+    let base = data.sets[name]?.base;
+
+    while (base && data.sets[base] && !seen.has(base)) {
+        path.unshift(base);
+        seen.add(base);
+        base = data.sets[base].base;
+    }
+
+    const mods = (data.sets[name]?.modifiers || []).map(mod => ` + [${mod}]`).join('');
+    return { label: path.join(' › ') + mods, key: path.join('\u0000') };
 }
 
 function describeState() {
