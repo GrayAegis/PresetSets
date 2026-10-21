@@ -12,7 +12,10 @@ Works with any Chat Completion preset, including NemoEngine with NemoPresetExt.
 ## Install
 
 Copy the `PresetSets` folder into `SillyTavern/public/scripts/extensions/third-party/`, then
-reload SillyTavern. The panel is under **Extensions → Preset Sets**.
+reload SillyTavern.
+
+The everyday controls sit under the Chat Completion preset list. Everything else is under
+**Extensions → Preset Sets**.
 
 ## What a set is
 
@@ -20,30 +23,50 @@ A set is a list of the prompts that are switched on. Applying it switches those 
 other toggleable prompt off. It never changes prompt text, prompt order, samplers or context
 size, and it never writes to the preset file. Sets belong to the preset they were saved in.
 
-## Using it
+## The bar under the preset list
 
-1. Load the preset and switch prompts on and off the way you want them.
-2. **Save as new…** and give the set a name.
-3. Repeat for each combination you use.
-4. With a persona selected, choose its set under **Set for <persona> in this preset**.
-5. Optionally choose a **Set for personas with no link**. This is what applies when the persona
-   has no link of its own.
+The list shows the sets in this preset, with the one in use marked "(active)". The buttons are:
 
-With **Apply the linked set automatically** on, the persona's set is applied when you change
-persona, open a chat, switch preset, and again just before each generation.
+- ✓ **Apply**: apply the chosen set.
+- ✎ **Edit**: choose which prompts the set switches on (see below).
+- ⟳ **Update**: replace the set with the prompts switched on now. Hidden while the preset is
+  locked.
+- \+ **New**: make a new set, starting from the prompts switched on now.
+- 🔗 **Link**: use the chosen set for the current persona in this preset. It lights up when the
+  set is linked; click again to unlink.
+- 🔒 **Lock**: lock or unlock the preset (see below).
 
-**Apply** applies the selected set by hand. **Update** replaces the selected set with the prompts
-switched on now.
+The line underneath says which set applies to the persona and whether the toggles match it.
 
-## Guarded prompts
+With **Apply the linked set automatically** on (in the Extensions panel), the persona's set is
+applied when you change persona, open a chat, switch preset, and again just before each
+generation. Personas with no link use the **Set for personas with no link**, if there is one.
 
-**Guarded prompts…** lets you mark prompts that must never be on by mistake. Before each
-generation, if a guarded prompt is switched on while the active set has it off, generation is
-stopped with a message naming the prompt.
+## Editing a set
 
-The check only ever stops a guarded prompt from being on. It runs even when automatic applying is
-off. It also stops generation if the persona is linked to a set that no longer exists, there is
-no set for unlinked personas, and the preset has guarded prompts.
+**Edit** opens the set's prompts grouped under the preset's own section headers, with on/total
+counts for each section. You can search, or show only the prompts that are on.
+
+Prompts that only work one at a time switch each other off here as they do in NemoPresetExt: one
+Vex, one length, one tense and so on. This uses NemoPresetExt's `@mutual-exclusive-group` and
+`@exclusive-with` markers in the prompt text.
+
+Saving an edit to the set in use applies it straight away.
+
+## Locking a preset
+
+A locked preset only changes its toggles through sets:
+
+- Switching a prompt by hand, whether with SillyTavern's switches or NemoPresetExt's trays and
+  section toggles, is undone straight away with a notice.
+- The preset's own **Update**, **Rename** and **Delete** buttons do nothing.
+- Prompt text and order can still be edited, but can't be saved to the preset file.
+
+To change the base preset itself, unlock it, make the change, save the preset, and lock it again.
+Importing a new version of the preset over it still works while it is locked.
+
+While locked, the toggles are held to the set applied last. If no set has been applied since the
+preset was loaded, they are held to the preset's own saved toggles.
 
 ## Keep the base preset safe
 
@@ -51,22 +74,21 @@ If the extension is turned off, fails to load, or a persona has no set, the pres
 toggles are what you get. Keep those saved toggles as the safe default, and put anything riskier
 in a set.
 
-Saving the preset while a set is applied saves that set's toggles as the preset's defaults. If
-you mean to update the base preset's text or modules, apply the safe set first, then save.
+Saving the preset while a set is applied saves that set's toggles as the preset's defaults. That
+is what the lock prevents.
 
 ## After updating the base preset
 
-- New prompts start off in every set until you add them with **Update**.
-- If a set lists a prompt the preset no longer has, a warning names how many. **Update** the set
-  to clear it.
-- The status line at the bottom of the panel shows which set applies and whether the toggles
-  currently match it.
+- New prompts start off in every set. Use **Edit** to add them to the sets that should have them.
+- If a set lists a prompt the preset no longer has, a warning names how many. Editing or updating
+  the set clears it.
+- Renaming the preset (while unlocked) carries its sets and persona links over to the new name.
 
 ## Moving sets
 
-**Export sets** saves the current preset's sets, its guarded prompts and its persona links to a
-file. **Import sets…** always imports into the preset that is loaded now, so you can carry sets
-over to a renamed or new copy of a preset. Sets with the same name are replaced.
+**Export sets** saves the current preset's sets and persona links to a file. **Import sets…**
+always imports into the preset that is loaded now, so you can carry sets over to a renamed or new
+copy of a preset. Sets with the same name are replaced.
 
 ## Slash commands
 
