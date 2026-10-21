@@ -7,7 +7,8 @@ Keep one base preset with every module in it. Save the combinations you use as s
 update the base preset, every set picks up the changes, because a set only records which prompts
 are switched on.
 
-Works with any Chat Completion preset, including NemoEngine with NemoPresetExt.
+Works with any Chat Completion preset. NemoPresetExt is not needed; if it's installed, Preset Sets
+works alongside it.
 
 ## Install
 
@@ -47,9 +48,10 @@ generation. Personas with no link use the **Set for personas with no link**, if 
 **Edit** opens the set's prompts grouped under the preset's own section headers, with on/total
 counts for each section. You can search, or show only the prompts that are on.
 
-Prompts that only work one at a time switch each other off here as they do in NemoPresetExt: one
-Vex, one length, one tense and so on. This uses NemoPresetExt's `@mutual-exclusive-group` and
-`@exclusive-with` markers in the prompt text.
+Prompts that only work one at a time switch each other off here too: one Vex, one length, one
+tense and so on. This reads the `@mutual-exclusive-group` and `@exclusive-with` markers written in
+the prompt text, which NemoEngine presets include, so it works with or without NemoPresetExt.
+Presets without those markers allow any combination.
 
 Saving an edit to the set in use applies it straight away.
 
