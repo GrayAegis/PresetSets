@@ -230,3 +230,8 @@
     gap: 6px;
     text-align: left;
 }
+
+.ps-new-about {
+    font-size: 0.88em;
+    opacity: 0.75;
+}

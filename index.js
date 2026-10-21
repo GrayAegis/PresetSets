@@ -302,9 +302,12 @@ function rulesFor(data = presetData()) {
  * Read the exclusivity markers from every prompt's text. NemoPresetExt can keep switched-off
  * prompts' text out of memory, so the text is read through it when it is installed.
  */
-async function readAllMarkers() {
+/**
+ * Read prompts' text. NemoPresetExt can keep switched-off prompts' text out of memory, so the text
+ * is read through it when it is installed.
+ */
+async function readPromptTexts(prompts = promptManager.serviceSettings.prompts) {
     const cold = globalThis.NemoColdPrompts;
-    const prompts = promptManager.serviceSettings.prompts;
 
     const found = await Promise.all(prompts.map(async prompt => {
         let text = prompt?.content ?? '';
@@ -317,13 +320,20 @@ async function readAllMarkers() {
             }
         }
 
-        return [prompt.identifier, readMarkers(text)];
+        return [prompt.identifier, String(text || '')];
     }));
 
+    return new Map(found);
+}
+
+/** The exclusivity markers in a set of prompt texts, in prompt order. */
+function markersFrom(texts) {
     const groups = {};
     const withIds = {};
 
-    for (const [id, marks] of found) {
+    for (const [id, text] of texts) {
+        const marks = readMarkers(text);
+
         if (marks.group) {
             groups[id] = marks.group;
         }
@@ -336,6 +346,9 @@ async function readAllMarkers() {
     return { groups, withIds };
 }
 
+/** The prompt texts read last, kept in memory only (never saved), for descriptions in the editor. */
+let lastTexts = null;
+
 /** Re-read the markers, keep them with the preset's sets, and return the rules. */
 async function refreshRules() {
     if (!isReady()) {
@@ -343,7 +356,9 @@ async function refreshRules() {
     }
 
     const preset = currentPresetName();
-    const markers = await readAllMarkers();
+    const texts = await readPromptTexts();
+    lastTexts = { preset, texts };
+    const markers = markersFrom(texts);
     const data = presetData();
 
     if (!data || currentPresetName() !== preset) {
@@ -356,6 +371,28 @@ async function refreshRules() {
     }
 
     return rulesFor(data);
+}
+
+/**
+ * A short description of a prompt for hover text: its `@tooltip` marker if it has one (leading
+ * [tags] dropped), otherwise the start of its text with macros and markup taken out.
+ */
+function describePrompt(text) {
+    const source = String(text || '');
+    const tooltip = source.match(/\{\{\/\/\s*@tooltip\s+([\s\S]*?)\s*\}\}/)?.[1];
+
+    if (tooltip) {
+        return tooltip.replace(/^(\s*\[[^\]]*\]\s*)+/, '').trim();
+    }
+
+    const plain = source
+        .replace(/\{\{\/\/[\s\S]*?\}\}/g, ' ')
+        .replace(/\{\{[^{}]*\}\}/g, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return plain.length > 280 ? `${plain.slice(0, 277).trimEnd()}…` : plain;
 }
 
 /** The prompts a set switches on, with its base and modifiers worked in. */
@@ -1147,6 +1184,8 @@ async function checkNewPrompts() {
     noticeOpen = true;
 
     try {
+        const freshIds = new Set(fresh.map(row => row.id));
+        const texts = await readPromptTexts(promptManager.serviceSettings.prompts.filter(prompt => freshIds.has(prompt.identifier)));
         const names = [...setNames(data, 'set'), ...setNames(data, 'modifier')];
         const content = document.createElement('div');
         content.classList.add('ps-new');
@@ -1167,6 +1206,7 @@ async function checkNewPrompts() {
 
             const title = document.createElement('b');
             title.textContent = row.name;
+            const about = describePrompt(texts.get(row.id));
 
             const chips = document.createElement('div');
             chips.classList.add('ps-chips');
@@ -1189,7 +1229,13 @@ async function checkNewPrompts() {
                 picks.push({ id: row.id, name, box });
             }
 
-            block.append(title, chips);
+            block.append(title);
+
+            if (about) {
+                block.appendChild(element('div', 'ps-new-about', about));
+            }
+
+            block.appendChild(chips);
             content.appendChild(block);
         }
 
@@ -1282,6 +1328,7 @@ async function editSet(name = null) {
     }
 
     const rules = await refreshRules();
+    const texts = lastTexts?.preset === preset ? lastTexts.texts : new Map();
     const rows = readRows();
     const order = [...orderIds()];
     const existing = name ? data.sets[name] : null;
@@ -1462,7 +1509,9 @@ async function editSet(name = null) {
         const bases = possibleBases(data.sets, name);
         const baseRow = element('label', 'ps-editor-field');
         baseRow.appendChild(element('span', null, 'Builds on'));
-        const baseSelect = makeSelect([['', '— Nothing —'], ...bases.sort((a, b) => a.localeCompare(b)).map(item => [item, item])], state.base);
+        // Each choice shows what it is built from (Base › DC), sorted like the tree.
+        const chains = bases.map(item => [item, setChain(data, item)]).sort((a, b) => a[1].key.localeCompare(b[1].key));
+        const baseSelect = makeSelect([['', '— Nothing —'], ...chains.map(([item, chain]) => [item, chain.label])], state.base);
         baseSelect.addEventListener('change', () => {
             state.base = baseSelect.value || null;
             recomputeFrom();
@@ -1521,7 +1570,8 @@ async function editSet(name = null) {
 
         if (state.kind === 'set') {
             const others = setNames(data, 'set').filter(item => item !== name);
-            const compare = makeSelect([['', 'Compare with…'], ...others.map(item => [item, item])], state.compareName);
+            const compareChains = others.map(item => [item, setChain(data, item)]).sort((a, b) => a[1].key.localeCompare(b[1].key));
+            const compare = makeSelect([['', 'Compare with…'], ...compareChains.map(([item, chain]) => [item, chain.label])], state.compareName);
             compare.addEventListener('change', () => {
                 state.compareName = compare.value;
                 state.compare = compare.value ? resolve(data.sets, compare.value, rules).ids : null;
@@ -1571,6 +1621,7 @@ async function editSet(name = null) {
             }
 
             const label = element('label', 'checkbox_label ps-editor-row');
+            label.title = describePrompt(texts.get(row.id));
 
             if (SUB_HEADER.test(row.name)) {
                 label.classList.add('ps-editor-sub');

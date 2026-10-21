@@ -69,11 +69,13 @@ The line underneath says which set applies, why, and whether the toggles match i
 ## Editing
 
 **Edit** opens the prompts grouped under the preset's own section headers, with on/total counts
-for each section. You can search, and choose what to show: everything, only what's switched on,
+for each section. Hover over a prompt to see its description (its `@tooltip` marker, or the start
+of its text). You can search, and choose what to show: everything, only what's switched on,
 only what this set changes, or only what differs from another set you pick under
 **Compare with…**.
 
-For a set, choose what it **builds on** and which **modifiers** it uses, then tick the prompts it
+For a set, choose what it **builds on** (each choice shows its own chain, such as `Base › Fantasy`)
+and which **modifiers** it uses, then tick the prompts it
 should switch on. Only the differences are stored. A dot marks each prompt this set changes; click
 the dot to follow the base again, or use **Follow all** to undo every change. Changing what a set
 builds on keeps its current toggles and works out the differences again.
