@@ -51,10 +51,12 @@ them.
 
 ## The bar under the preset list
 
-The list shows the sets and modifiers in this preset, in the order their layers apply. A set shows
-what it's built from, such as `Base › Fantasy + [Romance] › Fantasy: Romance` (Base, then Fantasy,
-then the Romance modifier, then the set's own changes). A modifier shows what it was made against,
-such as `Base + [World] › [Persona]`. The list is sorted the same way, so it reads like the tree. The set in use is marked with ●. The buttons are:
+The list shows the sets and modifiers in this preset, each by name first, then what it's made of in
+the order things apply: `Fantasy: Romance (Base + Fantasy + [Romance])` is Base, then Fantasy, then
+the Romance modifier, then the set's own changes. Modifiers are in square brackets, and show what
+they were made against: `[Persona] (made against Base + [World])`. The list is sorted like the
+tree, so each set sits under what it builds on. The set and modifier in use are marked with ●. The
+buttons are:
 
 - ✓ **Apply**: apply the chosen set.
 - ✎ **Edit**: change the chosen set or modifier (see below).
@@ -75,7 +77,7 @@ of its text). You can search, and choose what to show: everything, only what's s
 only what this set changes, or only what differs from another set you pick under
 **Compare with…**.
 
-For a set, choose what it **builds on** (each choice shows its own chain, such as `Base › Fantasy`)
+For a set, choose what it **builds on** (each choice shows what it's made of, such as `Fantasy (Base)`)
 and which **modifiers** it uses, then tick the prompts it should switch on or off on top. A new set
 starts from exactly what it builds on, so building on Base and ticking a modifier shows Base plus
 that modifier, ready for your own changes. Only the differences are stored. A dot marks each
@@ -92,7 +94,7 @@ modifier is **made against**: a set (or the preset's own toggles), and under **A
 it is meant to go after, in order. Each prompt then shows whether it is on or off there already,
 and a change that matches, such as switching on something already on, is dimmed since it does
 nothing there. What it's made against is saved with the modifier and decides where it is listed,
-so `Base + [World] › [Persona]` sits right after `Base › [World]`. It never changes what the modifier
+so `[Persona] (made against Base + [World])` sits right after `[World]`. It never changes what the modifier
 does: a set still ticks each modifier it uses.
 
 Saving a change to the set in use, or to anything it builds on, applies it straight away. The

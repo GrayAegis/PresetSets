@@ -2251,26 +2251,25 @@ function setChain(data, name) {
         base = data.sets[base].base;
     }
 
-    // In the order things apply: each set's modifiers come before the set's own changes, so
-    // "Base › DC + [Ero] › DC: Ero" reads as Base, then DC, then [Ero], then DC: Ero's changes.
-    let label = '';
+    // Name first, then what it's made of in the order things apply: "DC: Ero (Base + DC + [Ero])"
+    // is Base, then DC, then the Ero modifier, then DC: Ero's own changes. A set's modifiers apply
+    // before its own changes, so each ancestor reads as its modifiers, then its name.
+    const parts = [];
 
     path.forEach((setName, index) => {
-        const mods = (data.sets[setName]?.modifiers || []).map(mod => `[${mod}]`);
+        parts.push(...(data.sets[setName]?.modifiers || []).map(mod => `[${mod}]`));
 
-        if (index === 0) {
-            label = mods.length ? `${mods.join(' + ')} › ${setName}` : setName;
-        } else {
-            label += `${mods.map(mod => ` + ${mod}`).join('')} › ${setName}`;
+        if (index < path.length - 1) {
+            parts.push(setName);
         }
     });
 
-    return { label, key: path.join('\u0000') };
+    return { label: parts.length ? `${name} (${parts.join(' + ')})` : name, key: path.join('\u0000') };
 }
 
 /**
- * A modifier's label and sort key, shown after what it was made against:
- * "Base + [DC] › [Mei]" sorts straight after "[DC]" made against Base.
+ * A modifier's label and sort key: its name, then what it was made against, e.g.
+ * "[Mei] (made against Base + [DC])", sorted straight after "[DC] (made against Base)".
  */
 function modifierChain(data, name) {
     const context = data.sets[name]?.context;
@@ -2281,9 +2280,9 @@ function modifierChain(data, name) {
 
     const base = context.base && data.sets[context.base] ? setChain(data, context.base) : null;
     const mods = context.modifiers.filter(mod => mod !== name && data.sets[mod]?.kind === 'modifier');
-    const before = [base?.label, ...mods.map(mod => `[${mod}]`)].filter(Boolean).join(' + ');
+    const against = [base ? context.base : null, ...mods.map(mod => `[${mod}]`)].filter(Boolean).join(' + ');
     const key = [...(base ? base.key.split('\u0000') : []), ...mods, name].join('\u0000');
-    return { label: before ? `${before} › [${name}]` : `[${name}]`, key };
+    return { label: against ? `[${name}] (made against ${against})` : `[${name}]`, key };
 }
 
 function describeState() {
