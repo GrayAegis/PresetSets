@@ -59,7 +59,7 @@ like the tree. The set in use is marked with ●. The buttons are:
 - ✎ **Edit**: change the chosen set or modifier (see below).
 - ⟳ **Update**: make the set switch on exactly the prompts that are on now. Hidden while the
   preset is locked.
-- \+ **New**: make a new set or modifier, starting from the prompts switched on now.
+- \+ **New**: make a new set or modifier.
 - 🔗 **Link**: choose where the set is used (see below). It lights up when the set is linked for
   the current persona or card.
 - 🔒 **Lock**: lock or unlock the preset (see below).
@@ -75,10 +75,16 @@ only what this set changes, or only what differs from another set you pick under
 **Compare with…**.
 
 For a set, choose what it **builds on** (each choice shows its own chain, such as `Base › Fantasy`)
-and which **modifiers** it uses, then tick the prompts it
-should switch on. Only the differences are stored. A dot marks each prompt this set changes; click
-the dot to follow the base again, or use **Follow all** to undo every change. Changing what a set
-builds on keeps its current toggles and works out the differences again.
+and which **modifiers** it uses, then tick the prompts it should switch on or off on top. A new set
+starts from exactly what it builds on, so building on Base and ticking a modifier shows Base plus
+that modifier, ready for your own changes. Only the differences are stored. A dot marks each
+prompt this set changes; click the dot to follow the base again, or use **Follow all** to undo
+every change. **Start from what's on now** ticks exactly the prompts switched on at the moment.
+
+Changing what a set builds on, or its modifiers, keeps the changes made in the set itself;
+everything else follows the new layers. Modifiers apply in the order they were ticked, shown as
+1, 2, 3; where two disagree, the later one wins. Untick a modifier and tick it again to move it
+last.
 
 For a modifier, each prompt cycles between **–** (leave alone), **On** and **Off**. Next to it, each
 prompt shows whether it is on or off in a reference you pick under **Shown against**: any set, or

@@ -9,7 +9,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import {
-    allDependants, changesBetween, checkAll, directDependants, excludes, inherited,
+    allDependants, applyChanges, changesBetween, checkAll, directDependants, excludes, inherited,
     normaliseSet, possibleBases, readMarkers, removeKeeping, renameReferences, resolve,
 } from './layers.js';
 
@@ -1338,7 +1338,7 @@ async function editSet(name = null) {
         kind: existing?.kind ?? 'set',
         base: existing?.base ?? null,
         modifiers: [...(existing?.modifiers ?? [])],
-        final: new Set(existing ? (existing.kind === 'set' ? resolve(data.sets, name, rules).ids : []) : captureIds()),
+        final: new Set(existing?.kind === 'set' ? resolve(data.sets, name, rules).ids : []),
         change: new Map(existing?.kind === 'modifier'
             ? [...existing.on.map(id => [id, 'on']), ...existing.off.map(id => [id, 'off'])]
             : []),
@@ -1518,6 +1518,23 @@ async function editSet(name = null) {
         state.final.add(id);
     }
 
+    /**
+     * Change what the set builds on, or its modifiers, keeping the changes made in this set: the
+     * rest follows the new layers.
+     */
+    function relayerKeepingOwn(change, redrawLayers = false) {
+        const own = changesBetween(state.from, [...state.final], rules);
+        change();
+        recomputeFrom();
+        state.final = applyChanges(new Set(state.from), own.on, own.off, rules);
+
+        if (redrawLayers) {
+            buildLayers();
+        }
+
+        updateAll();
+    }
+
     function buildLayers() {
         layerBox.innerHTML = '';
 
@@ -1535,11 +1552,9 @@ async function editSet(name = null) {
         // Each choice shows what it is built from (Base › DC), sorted like the tree.
         const chains = bases.map(item => [item, setChain(data, item)]).sort((a, b) => a[1].key.localeCompare(b[1].key));
         const baseSelect = makeSelect([['', '— Nothing —'], ...chains.map(([item, chain]) => [item, chain.label])], state.base);
-        baseSelect.addEventListener('change', () => {
+        baseSelect.addEventListener('change', () => relayerKeepingOwn(() => {
             state.base = baseSelect.value || null;
-            recomputeFrom();
-            updateAll();
-        });
+        }, true));
         baseRow.appendChild(baseSelect);
         layerBox.appendChild(baseRow);
 
@@ -1553,18 +1568,25 @@ async function editSet(name = null) {
                 const box = element('input');
                 box.type = 'checkbox';
                 box.checked = state.modifiers.includes(modName);
-                box.addEventListener('change', () => {
-                    state.modifiers = modifiers.filter(item => item === modName ? box.checked : state.modifiers.includes(item));
-                    recomputeFrom();
-                    updateAll();
-                });
-                chip.append(box, element('span', null, modName));
+                // Modifiers apply in the order they were ticked; untick and tick again to move one last.
+                box.addEventListener('change', () => relayerKeepingOwn(() => {
+                    state.modifiers = box.checked
+                        ? [...state.modifiers.filter(item => item !== modName), modName]
+                        : state.modifiers.filter(item => item !== modName);
+                }, true));
+                const place = state.modifiers.indexOf(modName);
+                chip.append(box, element('span', null, place === -1 ? modName : `${place + 1}. ${modName}`));
                 chips.appendChild(chip);
             }
 
             modRow.appendChild(chips);
             layerBox.appendChild(modRow);
         }
+
+        const steps = [state.base, ...state.modifiers.map(mod => `[${mod}]`)].filter(Boolean);
+        layerBox.appendChild(element('div', 'opacity50p', steps.length
+            ? `Applied in order: ${steps.join(', then ')}, then this set's own changes.${state.modifiers.length > 1 ? ' Where modifiers disagree, the later one wins; untick and tick one again to move it last.' : ''}`
+            : 'Builds on nothing: the set is exactly the prompts ticked below.'));
 
         if (dependants.length) {
             layerBox.appendChild(element('div', 'opacity50p', `Changes here also reach: ${dependants.join(', ')}.`));
@@ -1615,6 +1637,14 @@ async function editSet(name = null) {
                 updateAll();
             });
             toolBox.appendChild(reset);
+
+            const now = element('div', 'menu_button', 'Start from what\'s on now');
+            now.title = 'Tick exactly the prompts switched on right now, keeping what this set builds on';
+            now.addEventListener('click', () => {
+                state.final = new Set(captureIds());
+                updateAll();
+            });
+            toolBox.appendChild(now);
         } else {
             const refChains = setNames(data, 'set').map(item => [item, setChain(data, item)]).sort((a, b) => a[1].key.localeCompare(b[1].key));
             const refRow = element('label', 'ps-editor-field ps-editor-ref');
@@ -1730,7 +1760,7 @@ async function editSet(name = null) {
         buildLayers();
         buildTools();
         hintBox.textContent = state.kind === 'set'
-            ? [groupHint, state.base || state.modifiers.length ? 'A dot marks a prompt changed in this set; click it to follow the base again.' : ''].filter(Boolean).join(' ')
+            ? [groupHint, 'Once a set builds on something, a dot marks each prompt it changes; click the dot to follow the base again. Hover a prompt for its description.'].filter(Boolean).join(' ')
             : [groupHint, 'Changes apply to every set that uses this modifier, on top of its base.'].filter(Boolean).join(' ');
         buildList();
         updateAll();
@@ -1773,8 +1803,9 @@ async function editSet(name = null) {
         return null;
     }
 
-    // Prompts the preset no longer has are dropped, as Update does.
-    const present = new Set(rows.map(row => row.id));
+    // Prompts the preset no longer has are dropped, as Update does. Prompts that can't be toggled
+    // (section headers, markers) are kept as inherited, never stored as switched off.
+    const present = orderIds();
     const updated = new Date().toISOString();
 
     if (state.kind === 'set') {
@@ -2126,7 +2157,7 @@ function addSettingsPanel() {
                 <div class="ps-buttons">
                     <div id="ps_apply" class="menu_button" title="Switch prompts to match this set">Apply</div>
                     <div id="ps_edit" class="menu_button" title="Choose what this set or modifier switches on and off">Edit…</div>
-                    <div id="ps_new" class="menu_button" title="Make a new set or modifier, starting from the prompts switched on now">New…</div>
+                    <div id="ps_new" class="menu_button" title="Make a new set or modifier">New…</div>
                     <div id="ps_update" class="menu_button" title="Make this set switch on exactly the prompts that are on now">Update</div>
                     <div id="ps_rename" class="menu_button">Rename…</div>
                     <div id="ps_delete" class="menu_button redWarningBG">Delete</div>
@@ -2349,7 +2380,7 @@ function addPresetBar() {
             <div id="ps_bar_update" class="menu_button menu_button_icon" title="Make this set switch on exactly the prompts that are on now">
                 <i class="fa-fw fa-solid fa-arrows-rotate"></i>
             </div>
-            <div id="ps_bar_new" class="menu_button menu_button_icon" title="New set or modifier, starting from the prompts switched on now">
+            <div id="ps_bar_new" class="menu_button menu_button_icon" title="New set or modifier">
                 <i class="fa-fw fa-solid fa-plus"></i>
             </div>
             <div id="ps_bar_link" class="menu_button menu_button_icon">
