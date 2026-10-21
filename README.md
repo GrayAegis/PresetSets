@@ -134,15 +134,18 @@ is what the lock prevents.
 
 Renaming a set or modifier updates everything that uses it, including links. Deleting one keeps
 every other set switching on exactly what it did: sets built on a deleted set move to what it
-built on, and sets using a deleted modifier have its changes worked into their own. Renaming the
-preset (while unlocked) carries its sets and links over to the new name.
+built on, and sets using a deleted modifier have its changes worked into their own. **Delete
+several…** in the Extensions panel deletes any number at once. Renaming the preset (while
+unlocked) carries its sets and links over to the new name.
 
 ## Moving sets
 
 **Export sets** saves the current preset's sets, modifiers and links to a file. **Import sets…**
 always imports into the preset that is loaded now, so you can carry sets over to a renamed or new
-copy of a preset. Sets with the same name are replaced. Files from older versions of Preset Sets
-import as sets that build on nothing.
+copy of a preset. If the preset already has sets, you choose to **Replace all** of them with the
+file's, or **Add to them**, which replaces only sets with the same name. Links to sets that are
+replaced away are removed. Files from older versions of Preset Sets import as sets that build on
+nothing.
 
 ## Slash commands
 

@@ -1027,6 +1027,66 @@ async function deleteSelected(name) {
     await autoApply();
 }
 
+/** Delete several sets and modifiers at once. Every set left keeps switching on what it does now. */
+async function deleteSeveral() {
+    const preset = currentPresetName();
+    const data = presetData(preset);
+    const names = [...setNames(data, 'set'), ...setNames(data, 'modifier')];
+
+    if (!names.length) {
+        toastr.info('This preset has no sets.', 'Preset Sets');
+        return;
+    }
+
+    const content = element('div', 'ps-links');
+    content.appendChild(element('h3', null, 'Delete sets and modifiers'));
+
+    const allLabel = element('label', 'checkbox_label');
+    const all = element('input');
+    all.type = 'checkbox';
+    allLabel.append(all, element('b', null, 'Select all'));
+    content.appendChild(allLabel);
+
+    const boxes = names.map(name => {
+        const label = element('label', 'checkbox_label');
+        const box = element('input');
+        box.type = 'checkbox';
+        box.value = name;
+        label.append(box, element('span', null, data.sets[name].kind === 'modifier' ? `${name} (modifier)` : name));
+        content.appendChild(label);
+        return box;
+    });
+
+    all.addEventListener('change', () => boxes.forEach(box => { box.checked = all.checked; }));
+    content.appendChild(element('div', 'opacity50p', 'Sets you keep go on switching on exactly what they do now, even if they built on one you delete. Links to deleted sets are removed.'));
+
+    const result = await callGenericPopup(content, POPUP_TYPE.CONFIRM, '', { okButton: 'Delete', cancelButton: 'Cancel', allowVerticalScrolling: true });
+    const picked = boxes.filter(box => box.checked).map(box => box.value);
+
+    if (result !== POPUP_RESULT.AFFIRMATIVE || !picked.length || currentPresetName() !== preset) {
+        return;
+    }
+
+    const rules = rulesFor(data);
+    const order = [...orderIds()];
+
+    for (const name of picked) {
+        if (data.sets[name]) {
+            removeKeeping(data.sets, name, rules, order);
+            relinkName(preset, name, null);
+        }
+    }
+
+    if (picked.includes(lastApplied?.name)) {
+        lastApplied = null;
+    }
+
+    saveSettingsDebounced();
+    toastr.success(`Deleted ${plural(picked.length, 'set')}.`, 'Preset Sets');
+    refreshUI();
+    await autoApply();
+}
+
 // ---------------------------------------------------------------------------------------------
 // New prompts
 // ---------------------------------------------------------------------------------------------
@@ -1723,7 +1783,33 @@ async function importSets(file) {
 
     const preset = currentPresetName();
     const data = presetData(preset, true);
+    const existing = setNames(data);
     let count = 0;
+
+    // With sets already here, choose: replace them all, or add these and replace same names only.
+    if (existing.length) {
+        const choice = await callGenericPopup(
+            `"${preset}" already has ${plural(existing.length, 'set')}. Replace them all with the ones in this file, or add these to them? Adding replaces only sets with the same name.`,
+            POPUP_TYPE.CONFIRM,
+            '',
+            { okButton: 'Replace all', cancelButton: 'Cancel', customButtons: [{ text: 'Add to them', result: POPUP_RESULT.CUSTOM1 }] },
+        );
+
+        if (choice === POPUP_RESULT.AFFIRMATIVE) {
+            const incoming = new Set(Object.keys(payload.sets).map(cleanName));
+
+            for (const name of existing) {
+                if (!incoming.has(name)) {
+                    relinkName(preset, name, null);
+                }
+            }
+
+            data.sets = {};
+            lastApplied = null;
+        } else if (choice !== POPUP_RESULT.CUSTOM1) {
+            return;
+        }
+    }
 
     for (const [name, raw] of Object.entries(payload.sets)) {
         const clean = cleanName(name);
@@ -1927,6 +2013,7 @@ function addSettingsPanel() {
                     <div id="ps_update" class="menu_button" title="Make this set switch on exactly the prompts that are on now">Update</div>
                     <div id="ps_rename" class="menu_button">Rename…</div>
                     <div id="ps_delete" class="menu_button redWarningBG">Delete</div>
+                    <div id="ps_delete_many" class="menu_button redWarningBG" title="Tick several sets and modifiers to delete at once">Delete several…</div>
                 </div>
                 <label for="ps_link">Set for <b class="ps_persona_name"></b></label>
                 <select id="ps_link" class="text_pole"></select>
@@ -1975,6 +2062,7 @@ function addSettingsPanel() {
     $('#ps_update').on('click', () => selected() && updateSelected(selected()));
     $('#ps_rename').on('click', () => selected() && renameSelected(selected()));
     $('#ps_delete').on('click', () => selected() && deleteSelected(selected()));
+    $('#ps_delete_many').on('click', () => deleteSeveral());
     $('#ps_lock').on('change', event => setLocked(/** @type {HTMLInputElement} */ (event.target).checked));
     $('#ps_export').on('click', () => exportSets());
     $('#ps_import').on('click', () => document.getElementById('ps_import_file').click());
