@@ -51,17 +51,18 @@ them.
 
 ## The bar under the preset list
 
-The list shows the sets and modifiers in this preset. Each set shows what it's built from, such
-as `Base › Fantasy › Fantasy: Romance + [Romance]`, and the list is sorted the same way, so it reads
-like the tree. The set in use is marked with ●. The buttons are:
+The list shows the sets and modifiers in this preset, in the order their layers apply. A set shows
+what it's built from, such as `Base › Fantasy + [Romance] › Fantasy: Romance` (Base, then Fantasy,
+then the Romance modifier, then the set's own changes). A modifier shows what it was made against,
+such as `Base + [World] › [Persona]`. The list is sorted the same way, so it reads like the tree. The set in use is marked with ●. The buttons are:
 
 - ✓ **Apply**: apply the chosen set.
 - ✎ **Edit**: change the chosen set or modifier (see below).
 - ⟳ **Update**: make the set switch on exactly the prompts that are on now. Hidden while the
   preset is locked.
 - \+ **New**: make a new set or modifier.
-- 🔗 **Link**: choose where the set is used (see below). It lights up when the set is linked for
-  the current persona or card.
+- 🔗 **Link**: choose where the set or modifier is used (see below). It lights up when it's
+  linked for the current persona or card.
 - 🔒 **Lock**: lock or unlock the preset (see below).
 
 The line underneath says which set applies, why, and whether the toggles match it.
@@ -86,29 +87,38 @@ everything else follows the new layers. Modifiers apply in the order they were t
 1, 2, 3; where two disagree, the later one wins. Untick a modifier and tick it again to move it
 last.
 
-For a modifier, each prompt cycles between **–** (leave alone), **On** and **Off**. Next to it, each
-prompt shows whether it is on or off in a reference you pick under **Shown against**: any set, or
-the preset's own toggles. It starts at the bottom of the first chain that uses the modifier. A
-change that matches the reference, such as switching on something already on, is dimmed, since it
-does nothing there.
+For a modifier, each prompt cycles between **–** (leave alone), **On** and **Off**. Choose what the
+modifier is **made against**: a set (or the preset's own toggles), and under **After**, any modifiers
+it is meant to go after, in order. Each prompt then shows whether it is on or off there already,
+and a change that matches, such as switching on something already on, is dimmed since it does
+nothing there. What it's made against is saved with the modifier and decides where it is listed,
+so `Base + [World] › [Persona]` sits right after `Base › [World]`. It never changes what the modifier
+does: a set still ticks each modifier it uses.
 
 Saving a change to the set in use, or to anything it builds on, applies it straight away. The
 editor lists the sets a change will also reach.
 
 ## Links
 
-A set can be linked to:
+What applies is a set, plus the persona's modifier on top of it.
 
-- a **persona**, wherever it's used;
-- a **character card** (or group chat), for any persona without a link of its own;
-- a **persona with a card**, for that pairing only.
+The set comes from the first of these that has one:
 
-The most specific link wins: persona with card, then persona, then card. If none applies, the
-**Set for anything without a link** is used, if there is one. A link to a set that no longer
-exists is skipped.
+1. the **persona**'s set, wherever it's used;
+2. the **character card**'s set (or the group chat's), for any persona without a set of its own;
+3. the **Set for anything without a link**, if there is one.
 
-With **Apply the linked set automatically** on, the linked set is applied when you change persona,
-open a chat, switch preset, and again just before each generation.
+A persona can also have a **modifier**, stacked on top of whichever set applies. That way a
+persona brings its own changes to every world: with a card linked to `Fantasy` and a persona
+modifier `[Wren]`, you get `Fantasy + [Wren]`; open a chat whose card is linked to `Modern`
+instead, and you get `Modern + [Wren]`. If no set applies, the modifier goes on top of the
+preset's own toggles. Links to sets or modifiers that no longer exist are skipped.
+
+Link from the bar: choose a set or modifier and press 🔗. Or use the selects in the Extensions
+panel. Applying a set by hand with ✓ applies just that set, without the persona's modifier.
+
+With **Apply the linked set automatically** on, the linked set and modifier are applied when you
+change persona, open a chat, switch preset, and again just before each generation.
 
 ## Locking a preset
 

@@ -25,7 +25,7 @@ export function normaliseSet(raw) {
 
     const kind = raw.kind === 'modifier' ? 'modifier' : 'set';
 
-    return {
+    const set = {
         kind,
         base: kind === 'set' && typeof raw.base === 'string' && raw.base ? raw.base : null,
         modifiers: kind === 'set' ? unique(raw.modifiers) : [],
@@ -33,6 +33,17 @@ export function normaliseSet(raw) {
         off: unique(raw.off),
         updated: typeof raw.updated === 'string' ? raw.updated : new Date().toISOString(),
     };
+
+    // What a modifier was made against (a set plus other modifiers), for showing and editing it.
+    // It never changes what the modifier does.
+    if (kind === 'modifier' && raw.context && typeof raw.context === 'object') {
+        set.context = {
+            base: typeof raw.context.base === 'string' && raw.context.base ? raw.context.base : null,
+            modifiers: unique(raw.context.modifiers),
+        };
+    }
+
+    return set;
 }
 
 /** True when switching `id` on should switch `other` off (same exclusive group, or named). */
@@ -205,7 +216,16 @@ export function renameReferences(sets, from, to) {
             set.base = to;
         }
 
-        set.modifiers = (set.modifiers || []).map(mod => (mod === from ? to : mod));
+        set.modifiers = (set.modifiers || []).map(mod => (mod === from ? to : mod)).filter(Boolean);
+
+        if (set.context) {
+            set.context.base = set.context.base === from ? to : set.context.base;
+            set.context.modifiers = set.context.modifiers.map(mod => (mod === from ? to : mod)).filter(Boolean);
+
+            if (!set.context.base && !set.context.modifiers.length) {
+                delete set.context;
+            }
+        }
     }
 }
 
@@ -240,6 +260,9 @@ export function removeKeeping(sets, name, rules, order = null) {
     }
 
     Object.assign(sets, next);
+
+    // A modifier shown against the deleted one is shown against what's left.
+    renameReferences(sets, name, null);
     return affected;
 }
 
