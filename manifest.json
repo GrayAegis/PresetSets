@@ -1,0 +1,12 @@
+{
+    "display_name": "Preset Sets",
+    "loading_order": 950,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Ethan",
+    "version": "1.0.0",
+    "auto_update": false,
+    "generate_interceptor": "presetSetsPreflight"
+}

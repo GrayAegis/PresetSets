@@ -1,0 +1,44 @@
+.preset-sets-settings .ps-context {
+    margin-bottom: 6px;
+}
+
+.preset-sets-settings .ps-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin: 4px 0 8px;
+}
+
+.preset-sets-settings .menu_button.disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+.preset-sets-settings .ps-status {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    font-size: 0.9em;
+}
+
+.ps-guard-popup {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    text-align: left;
+}
+
+.ps-guard-popup .ps-guard-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 55vh;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.ps-guard-popup .ps-guard-list label[hidden] {
+    display: none;
+}
