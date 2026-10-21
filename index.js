@@ -67,20 +67,35 @@ function getSettings() {
         }
     }
 
-    // Persona-with-card links were replaced by stacks. A persona modifier saved by version 2.0 joins
-    // that persona's stack.
+    // Persona-with-card links were replaced by stacks. Older links named one set or modifier;
+    // they become stacks here, while the name's kind can still be looked up. A persona modifier
+    // saved by version 2.0 joins that persona's stack.
     delete settings.pairLinks;
 
-    if (settings.personaMods) {
-        for (const [avatar, byPreset] of Object.entries(settings.personaMods)) {
+    if (!settings.linksAreStacks) {
+        const kindOf = (preset, name) => settings.presets?.[preset]?.sets?.[name]?.kind;
+        const toStack = (preset, raw) => (typeof raw === 'string'
+            ? (kindOf(preset, raw) === 'modifier' ? { set: null, modifiers: [raw] } : { set: raw, modifiers: [] })
+            : raw);
+
+        for (const root of [settings.links, settings.cardLinks]) {
+            for (const byPreset of Object.values(root)) {
+                for (const [preset, raw] of Object.entries(byPreset || {})) {
+                    byPreset[preset] = toStack(preset, raw);
+                }
+            }
+        }
+
+        for (const [avatar, byPreset] of Object.entries(settings.personaMods || {})) {
             for (const [preset, mod] of Object.entries(byPreset || {})) {
                 const record = (settings.links[avatar] ??= {});
-                const now = typeof record[preset] === 'string' ? { set: record[preset], modifiers: [] } : (record[preset] || { set: null, modifiers: [] });
+                const now = record[preset] || { set: null, modifiers: [] };
                 record[preset] = { set: now.set ?? null, modifiers: [...new Set([...(now.modifiers || []), mod])] };
             }
         }
 
         delete settings.personaMods;
+        settings.linksAreStacks = true;
     }
 
     return settings;
@@ -451,7 +466,7 @@ function ensureKnown(data) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Links: persona set, card set, persona modifier
+// Links: a stack (set plus modifiers) for the persona and for the card
 // ---------------------------------------------------------------------------------------------
 
 /** The open character card, or group chat, as a stable key and a display name. */
@@ -574,12 +589,15 @@ function targetFor(avatar = user_avatar, preset = currentPresetName(), card = cu
     const personaStack = getStack('persona', preset, avatar, card);
     const cardStack = getStack('card', preset, avatar, card);
     const broken = [];
-    const keep = (name, kind) => {
+    const keep = (name, kind, isLink = true) => {
         if (data.sets[name]?.kind === kind) {
             return true;
         }
 
-        broken.push(name);
+        if (isLink) {
+            broken.push(name);
+        }
+
         return false;
     };
 
@@ -587,7 +605,7 @@ function targetFor(avatar = user_avatar, preset = currentPresetName(), card = cu
     let source = 'none';
 
     for (const [from, candidate] of [['persona', personaStack?.set], ['card', cardStack?.set], ['default', data.defaultSet]]) {
-        if (candidate && keep(candidate, 'set')) {
+        if (candidate && keep(candidate, 'set', from !== 'default')) {
             name = candidate;
             source = from;
             break;
@@ -596,7 +614,8 @@ function targetFor(avatar = user_avatar, preset = currentPresetName(), card = cu
 
     const cardModifiers = (cardStack?.modifiers || []).filter(mod => keep(mod, 'modifier'));
     const personaModifiers = (personaStack?.modifiers || []).filter(mod => keep(mod, 'modifier'));
-    const modifiers = [...new Set([...cardModifiers, ...personaModifiers])];
+    // A modifier in both stacks applies once, at the persona's position, so the persona's wins.
+    const modifiers = [...cardModifiers.filter(mod => !personaModifiers.includes(mod)), ...personaModifiers];
 
     if (!name && !modifiers.length) {
         return broken.length ? { name: null, source: 'none', modifiers: [], cardModifiers: [], personaModifiers: [], broken } : null;
@@ -697,7 +716,11 @@ function relinkName(preset, from, to) {
 
 /** A set select plus ordered modifier ticks, for one link. */
 function stackEditor(data, title, stack, noneLabel, onChange) {
-    const state = { set: stack?.set ?? null, modifiers: [...(stack?.modifiers || [])] };
+    // Anything in the stack that no longer exists is dropped, so it can't be saved back.
+    const state = {
+        set: data.sets[stack?.set]?.kind === 'set' ? stack.set : null,
+        modifiers: (stack?.modifiers || []).filter(mod => data.sets[mod]?.kind === 'modifier'),
+    };
     const box = element('div', 'ps-stack');
     box.appendChild(element('h4', null, title));
 
@@ -826,7 +849,7 @@ function reportApply(label, result, automatic) {
 }
 
 /**
- * Apply a target ({ name, modifier, source }) and remember it as the one in use. It is recorded
+ * Apply a target ({ name, modifiers, source }) and remember it as the one in use. It is recorded
  * before the toggles change, so a locked preset holds them to this target throughout, including
  * hand toggles made while the save is in progress.
  */
@@ -874,7 +897,7 @@ async function autoApply() {
     });
 }
 
-/** Apply a set by hand, exactly as it is (without the persona's modifier). */
+/** Apply a set by hand, exactly as it is (without any modifiers from links). */
 async function applyNamed(name) {
     const data = presetData();
 
@@ -1081,10 +1104,11 @@ function setLocked(value) {
 function onPresetRenamed({ apiId, oldName, newName } = {}) {
     const settings = getSettings();
 
-    if (apiId !== 'openai' || !oldName || !newName || !settings.presets[oldName] || settings.presets[newName]) {
+    if (apiId !== 'openai' || !oldName || !newName || !settings.presets[oldName]) {
         return;
     }
 
+    // A record under the new name can only be left over from a deleted preset; the live one wins.
     settings.presets[newName] = settings.presets[oldName];
     delete settings.presets[oldName];
 
@@ -1248,7 +1272,7 @@ async function deleteSelected(name) {
     removeKeeping(data.sets, name, rulesFor(data), [...orderIds()]);
     relinkName(preset, name, null);
 
-    if (lastApplied?.name === name || lastApplied?.modifiers?.includes(name)) {
+    if (lastApplied?.name === name) {
         lastApplied = null;
     }
 
@@ -1307,7 +1331,7 @@ async function deleteSeveral() {
         }
     }
 
-    if (picked.includes(lastApplied?.name) || (lastApplied?.modifiers || []).some(mod => picked.includes(mod))) {
+    if (picked.includes(lastApplied?.name)) {
         lastApplied = null;
     }
 
@@ -2197,6 +2221,11 @@ async function importSets(file) {
         const set = normaliseSet(raw);
 
         if (clean && set) {
+            // A name that changes kind (set to modifier or back) can't keep its links.
+            if (data.sets[clean] && data.sets[clean].kind !== set.kind) {
+                relinkName(preset, clean, null);
+            }
+
             data.sets[clean] = set;
             count++;
         }
@@ -2440,9 +2469,8 @@ function refreshPanel(selectName) {
         document.getElementById(id).classList.toggle('disabled', !chosen);
     }
 
-    for (const id of ['ps_apply', 'ps_update']) {
-        document.getElementById(id).classList.toggle('disabled', !isSet);
-    }
+    document.getElementById('ps_apply').classList.toggle('disabled', !isSet);
+    document.getElementById('ps_update').classList.toggle('disabled', !isSet || Boolean(data?.locked));
 }
 
 function addSettingsPanel() {
@@ -2855,7 +2883,7 @@ globalThis.PresetSets = {
     get persona() { return user_avatar; },
     get card() { return currentCard(); },
     target: () => targetFor(),
-    /** With a name, that set's prompts; without, what's linked now (set plus persona modifier). */
+    /** With a name, that set's prompts; without, what's linked now (set plus modifiers). */
     ids: (name) => (name ? setIds(name) : targetIds(targetFor())),
     plan: (name) => {
         const ids = name ? setIds(name) : targetIds(targetFor());

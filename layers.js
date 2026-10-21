@@ -246,7 +246,28 @@ export function removeKeeping(sets, name, rules, order = null) {
     const next = { ...sets };
     delete next[name];
 
-    for (const other of affected) {
+    // Bases before the sets built on them, so each set's new changes are worked out against a
+    // base that has already been fixed. Whatever the order they were stored in.
+    const pending = new Set(affected);
+    const ordered = [];
+    const visit = (other) => {
+        if (!pending.has(other)) {
+            return;
+        }
+
+        pending.delete(other);
+        const base = sets[other].base === name ? gone.base : sets[other].base;
+
+        if (base && pending.has(base)) {
+            visit(base);
+        }
+
+        ordered.push(other);
+    };
+
+    affected.forEach(visit);
+
+    for (const other of ordered) {
         const set = sets[other];
         const base = set.base === name ? gone.base : set.base;
         const modifiers = (set.modifiers || []).filter(mod => mod !== name);
