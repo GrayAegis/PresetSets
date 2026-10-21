@@ -143,10 +143,21 @@ function captureIds() {
     return readRows().filter(row => row.enabled).map(row => row.id);
 }
 
-/** What applying a set would change, without changing anything. */
+/** Every prompt in the active order, toggleable or not. */
+function orderIds() {
+    const pm = promptManager;
+    const order = pm.getPromptOrderForCharacter(pm.activeCharacter) || [];
+    return new Set(order.map(entry => entry?.identifier).filter(Boolean));
+}
+
+/**
+ * What applying a set would change, without changing anything. A set listing a prompt that
+ * can't be toggled (a marker, say) simply leaves it alone; only prompts the preset doesn't
+ * have at all count as missing.
+ */
 function planApply(ids, rows = readRows()) {
     const wanted = new Set(ids);
-    const present = new Set(rows.map(row => row.id));
+    const present = orderIds();
 
     return {
         changes: rows.filter(row => row.enabled !== wanted.has(row.id)),
