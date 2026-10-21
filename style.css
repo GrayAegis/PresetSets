@@ -235,3 +235,28 @@
     font-size: 0.88em;
     opacity: 0.75;
 }
+
+.ps-editor .ps-ref {
+    min-width: 2.4em;
+    margin-right: 6px;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-size: 0.75em;
+    text-align: center;
+    border: 1px solid currentColor;
+    opacity: 0.55;
+}
+
+.ps-editor .ps-ref[data-state="on"] {
+    color: #6ccf6c;
+    opacity: 0.9;
+}
+
+.ps-editor .ps-tri.ps-noop {
+    opacity: 0.45;
+    border-style: dashed;
+}
+
+.ps-editor-ref {
+    flex: 1 1 260px;
+}

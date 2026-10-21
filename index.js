@@ -1346,7 +1346,23 @@ async function editSet(name = null) {
         compare: null,
         compareName: '',
         show: 'all',
+        refName: '',
+        ref: new Set(),
     };
+
+    // A modifier is shown against a reference, so each row says whether the prompt is on there
+    // already. It starts at the bottom of the first chain that uses the modifier (Base, say).
+    const PRESET_OWN = '\u0000preset';
+    const refIds = (refName) => refName === PRESET_OWN
+        ? new Set(savedPresetIds() || [])
+        : (data.sets[refName] ? resolve(data.sets, refName, rules).ids : new Set());
+    {
+        const user = name ? directDependants(data.sets, name).find(item => data.sets[item].kind === 'set') : null;
+        const roots = setNames(data, 'set').filter(item => !data.sets[item].base);
+        state.refName = user ? setChain(data, user).key.split('\u0000')[0] : (roots[0] || PRESET_OWN);
+        state.ref = refIds(state.refName);
+    }
+    const refLabel = () => state.refName === PRESET_OWN ? 'the preset' : state.refName;
 
     const recomputeFrom = () => {
         state.from = state.kind === 'set'
@@ -1427,8 +1443,13 @@ async function editSet(name = null) {
             view.diff.textContent = isDifferent(view) ? (state.compare.has(view.id) ? `on in ${state.compareName}` : `off in ${state.compareName}`) : '';
         } else {
             const value = state.change.get(view.id) || '';
+            const already = state.ref.has(view.id);
             view.control.textContent = value === 'on' ? 'On' : value === 'off' ? 'Off' : '–';
             view.control.dataset.state = value;
+            view.control.classList.toggle('ps-noop', (value === 'on' && already) || (value === 'off' && !already));
+            view.ref.textContent = already ? 'on' : 'off';
+            view.ref.dataset.state = already ? 'on' : 'off';
+            view.ref.title = `${already ? 'On' : 'Off'} in ${refLabel()}${value && view.control.classList.contains('ps-noop') ? ', so this change does nothing there' : ''}`;
         }
     }
 
@@ -1461,6 +1482,8 @@ async function editSet(name = null) {
                 visible &&= isChanged(view);
             } else if (state.show === 'different') {
                 visible &&= isDifferent(view);
+            } else if (state.show === 'refon') {
+                visible &&= state.ref.has(view.id);
             }
 
             view.label.hidden = !visible;
@@ -1559,7 +1582,7 @@ async function editSet(name = null) {
 
         const showOptions = state.kind === 'set'
             ? [['all', 'All prompts'], ['on', 'Switched on'], ['changed', 'Changed in this set'], ['different', 'Different from the compared set']]
-            : [['all', 'All prompts'], ['changed', 'Changed by this modifier']];
+            : [['all', 'All prompts'], ['changed', 'Changed by this modifier'], ['refon', 'On in the reference']];
         const show = makeSelect(showOptions, state.show);
         show.title = 'Show';
         show.addEventListener('change', () => {
@@ -1592,6 +1615,19 @@ async function editSet(name = null) {
                 updateAll();
             });
             toolBox.appendChild(reset);
+        } else {
+            const refChains = setNames(data, 'set').map(item => [item, setChain(data, item)]).sort((a, b) => a[1].key.localeCompare(b[1].key));
+            const refRow = element('label', 'ps-editor-field ps-editor-ref');
+            refRow.appendChild(element('span', null, 'Shown against'));
+            const refSelect = makeSelect([...refChains.map(([item, chain]) => [item, chain.label]), [PRESET_OWN, 'The preset\'s own toggles']], state.refName);
+            refSelect.title = 'Each row shows whether the prompt is already on here, so you can tell what a change will do';
+            refSelect.addEventListener('change', () => {
+                state.refName = refSelect.value;
+                state.ref = refIds(state.refName);
+                updateAll();
+            });
+            refRow.appendChild(refSelect);
+            toolBox.appendChild(refRow);
         }
 
         total = element('span', 'ps-editor-total');
@@ -1681,7 +1717,8 @@ async function editSet(name = null) {
                     updateAll();
                 });
 
-                label.append(view.control, element('span', null, row.name));
+                view.ref = element('span', 'ps-ref');
+                label.append(view.control, view.ref, element('span', null, row.name));
             }
 
             (current?.body ?? list).appendChild(label);

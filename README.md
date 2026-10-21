@@ -80,7 +80,11 @@ should switch on. Only the differences are stored. A dot marks each prompt this 
 the dot to follow the base again, or use **Follow all** to undo every change. Changing what a set
 builds on keeps its current toggles and works out the differences again.
 
-For a modifier, each prompt cycles between **–** (leave alone), **On** and **Off**.
+For a modifier, each prompt cycles between **–** (leave alone), **On** and **Off**. Next to it, each
+prompt shows whether it is on or off in a reference you pick under **Shown against**: any set, or
+the preset's own toggles. It starts at the bottom of the first chain that uses the modifier. A
+change that matches the reference, such as switching on something already on, is dimmed, since it
+does nothing there.
 
 Saving a change to the set in use, or to anything it builds on, applies it straight away. The
 editor lists the sets a change will also reach.
