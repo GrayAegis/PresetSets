@@ -16,7 +16,7 @@ import {
 const MODULE_NAME = 'presetSets';
 const LOG = '[Preset Sets]';
 const EXPORT_FORMAT = 'preset-sets';
-const EXPORT_VERSION = 2;
+const EXPORT_VERSION = 3;
 
 const defaultSettings = {
     /** Apply the linked set whenever the persona, chat or preset changes, and before each generation. */
@@ -32,12 +32,10 @@ const defaultSettings = {
      * `markers` caches which prompts exclude each other, read from the prompt text.
      */
     presets: {},
-    /** Persona links: { [personaAvatar]: { [preset]: setName } } */
+    /** Persona links: { [personaAvatar]: { [preset]: { set, modifiers } } } */
     links: {},
-    /** Character card (or group chat) links: { [cardKey]: { [preset]: setName } } */
+    /** Character card (or group chat) links: { [cardKey]: { [preset]: { set, modifiers } } } */
     cardLinks: {},
-    /** Persona modifiers, stacked on whatever set applies: { [personaAvatar]: { [preset]: modifierName } } */
-    personaMods: {},
 };
 
 const EMPTY_RULES = Object.freeze({ groupOf: new Map(), withIds: new Map() });
@@ -69,8 +67,22 @@ function getSettings() {
         }
     }
 
-    // Persona-with-card links were replaced by persona modifiers.
+    // Persona-with-card links were replaced by stacks. A persona modifier saved by version 2.0 joins
+    // that persona's stack.
     delete settings.pairLinks;
+
+    if (settings.personaMods) {
+        for (const [avatar, byPreset] of Object.entries(settings.personaMods)) {
+            for (const [preset, mod] of Object.entries(byPreset || {})) {
+                const record = (settings.links[avatar] ??= {});
+                const now = typeof record[preset] === 'string' ? { set: record[preset], modifiers: [] } : (record[preset] || { set: null, modifiers: [] });
+                record[preset] = { set: now.set ?? null, modifiers: [...new Set([...(now.modifiers || []), mod])] };
+            }
+        }
+
+        delete settings.personaMods;
+    }
+
     return settings;
 }
 
@@ -463,17 +475,7 @@ function currentCard() {
 
 function linkPath(kind, preset, avatar, card) {
     const settings = getSettings();
-
-    if (kind === 'persona') {
-        return [settings.links, [avatar, preset]];
-    }
-
-    if (kind === 'card') {
-        return [settings.cardLinks, [card, preset]];
-    }
-
-    // 'personaMod': the modifier a persona stacks on top of whatever set applies.
-    return [settings.personaMods, [avatar, preset]];
+    return kind === 'persona' ? [settings.links, [avatar, preset]] : [settings.cardLinks, [card, preset]];
 }
 
 function getLink(kind, preset = currentPresetName(), avatar = user_avatar, card = currentCard()?.key) {
@@ -486,7 +488,7 @@ function getLink(kind, preset = currentPresetName(), avatar = user_avatar, card 
     return keys.reduce((node, key) => node?.[key], root) ?? null;
 }
 
-function setLink(kind, name, preset = currentPresetName(), avatar = user_avatar, card = currentCard()?.key) {
+function setLink(kind, value, preset = currentPresetName(), avatar = user_avatar, card = currentCard()?.key) {
     const [root, keys] = linkPath(kind, preset, avatar, card);
 
     if (keys.some(key => !key)) {
@@ -502,8 +504,8 @@ function setLink(kind, name, preset = currentPresetName(), avatar = user_avatar,
         node = node[key];
     }
 
-    if (name) {
-        node[keys.at(-1)] = name;
+    if (value) {
+        node[keys.at(-1)] = value;
     } else {
         delete node[keys.at(-1)];
 
@@ -521,12 +523,46 @@ function setLink(kind, name, preset = currentPresetName(), avatar = user_avatar,
 }
 
 /**
- * What should be active: a set, and the persona's modifier on top of it.
- *
- * The set is the persona's link if it has one, then the card's link, then the preset's set for
- * anything without a link. The persona's modifier, if it has one, goes on top of that set, or on
- * top of the preset's own toggles when no set applies. A link to something that no longer exists
- * is skipped, so a missing set never leaves an unexpected state in place.
+ * A link is a stack: a set (optional) and modifiers in order. Older links held a single set or
+ * modifier name, read here as a stack of one.
+ */
+function readStack(raw, data = presetData()) {
+    if (!raw) {
+        return null;
+    }
+
+    if (typeof raw === 'string') {
+        return data?.sets[raw]?.kind === 'modifier' ? { set: null, modifiers: [raw] } : { set: raw, modifiers: [] };
+    }
+
+    const modifiers = Array.isArray(raw.modifiers) ? [...new Set(raw.modifiers.filter(item => typeof item === 'string' && item))] : [];
+    const set = typeof raw.set === 'string' && raw.set ? raw.set : null;
+    return set || modifiers.length ? { set, modifiers } : null;
+}
+
+function getStack(kind, preset, avatar, card) {
+    return readStack(getLink(kind, preset, avatar, card), presetData(preset ?? currentPresetName()));
+}
+
+function setStack(kind, stack, preset, avatar, card) {
+    const clean = readStack(stack);
+    setLink(kind, clean ? { set: clean.set, modifiers: clean.modifiers } : null, preset, avatar, card);
+}
+
+function stackLabel(stack) {
+    if (!stack) {
+        return 'nothing';
+    }
+
+    return [stack.set, ...stack.modifiers.map(mod => `[${mod}]`)].filter(Boolean).join(' + ') || 'nothing';
+}
+
+/**
+ * What should be active, built from the links:
+ * - the set: the persona's set if its stack has one, else the card's, else the preset's set for
+ *   anything without a link (or the preset's own toggles if there is none);
+ * - then the card's modifiers, then the persona's modifiers, in order.
+ * Links to sets or modifiers that no longer exist are skipped and reported.
  */
 function targetFor(avatar = user_avatar, preset = currentPresetName(), card = currentCard()?.key) {
     const data = presetData(preset);
@@ -535,50 +571,49 @@ function targetFor(avatar = user_avatar, preset = currentPresetName(), card = cu
         return null;
     }
 
+    const personaStack = getStack('persona', preset, avatar, card);
+    const cardStack = getStack('card', preset, avatar, card);
     const broken = [];
-    let found = null;
-    const candidates = [
-        ['persona', getLink('persona', preset, avatar, card)],
-        ['card', getLink('card', preset, avatar, card)],
-        ['default', data.defaultSet],
-    ];
-
-    for (const [source, name] of candidates) {
-        if (!name) {
-            continue;
-        }
-
-        if (data.sets[name]?.kind === 'set') {
-            found = { name, source };
-            break;
+    const keep = (name, kind) => {
+        if (data.sets[name]?.kind === kind) {
+            return true;
         }
 
         broken.push(name);
+        return false;
+    };
+
+    let name = null;
+    let source = 'none';
+
+    for (const [from, candidate] of [['persona', personaStack?.set], ['card', cardStack?.set], ['default', data.defaultSet]]) {
+        if (candidate && keep(candidate, 'set')) {
+            name = candidate;
+            source = from;
+            break;
+        }
     }
 
-    let modifier = getLink('personaMod', preset, avatar, card);
+    const cardModifiers = (cardStack?.modifiers || []).filter(mod => keep(mod, 'modifier'));
+    const personaModifiers = (personaStack?.modifiers || []).filter(mod => keep(mod, 'modifier'));
+    const modifiers = [...new Set([...cardModifiers, ...personaModifiers])];
 
-    if (modifier && data.sets[modifier]?.kind !== 'modifier') {
-        broken.push(modifier);
-        modifier = null;
+    if (!name && !modifiers.length) {
+        return broken.length ? { name: null, source: 'none', modifiers: [], cardModifiers: [], personaModifiers: [], broken } : null;
     }
 
-    if (!found && !modifier) {
-        return broken.length ? { name: null, source: 'none', modifier: null, broken } : null;
-    }
-
-    return { name: found?.name ?? null, source: found?.source ?? 'none', modifier, broken };
+    return { name, source, modifiers, cardModifiers, personaModifiers, broken };
 }
 
-/** "DC + [Mei]", or "the preset's toggles + [Mei]" when only a modifier applies. */
+/** "Base + [Sailor Moon] + [Mei]", or "the preset's own toggles + [Mei]" with no set. */
 function targetLabel(target) {
     const base = target?.name ?? 'the preset\'s own toggles';
-    return target?.modifier ? `${base} + [${target.modifier}]` : base;
+    return [base, ...(target?.modifiers || []).map(mod => `[${mod}]`)].join(' + ');
 }
 
-/** The prompts a target switches on: its set (or the preset's own toggles), then the persona's modifier. */
+/** The prompts a target switches on: its set (or the preset's own toggles), then its modifiers in order. */
 function targetIds(target, data = presetData()) {
-    if (!target || (!target.name && !target.modifier)) {
+    if (!target || (!target.name && !target.modifiers?.length)) {
         return null;
     }
 
@@ -588,8 +623,18 @@ function targetIds(target, data = presetData()) {
         return null;
     }
 
-    const mod = target.modifier ? data?.sets[target.modifier] : null;
-    return mod ? [...applyChanges(new Set(base), mod.on, mod.off, rulesFor(data))] : base;
+    const ids = new Set(base);
+    const rules = rulesFor(data);
+
+    for (const name of target.modifiers || []) {
+        const mod = data?.sets[name];
+
+        if (mod?.kind === 'modifier') {
+            applyChanges(ids, mod.on, mod.off, rules);
+        }
+    }
+
+    return [...ids];
 }
 
 function sourceText(target) {
@@ -597,15 +642,19 @@ function sourceText(target) {
     const parts = [];
 
     switch (target?.source) {
-        case 'persona': parts.push(`set linked to ${personaName()}`); break;
-        case 'card': parts.push(`set linked to ${card}`); break;
+        case 'persona': parts.push(`set from ${personaName()}`); break;
+        case 'card': parts.push(`set from ${card}`); break;
         case 'default': parts.push('set for anything without a link'); break;
         case 'manual': parts.push('applied by hand'); break;
         default: break;
     }
 
-    if (target?.modifier) {
-        parts.push(`${personaName()}'s modifier`);
+    if (target?.cardModifiers?.length) {
+        parts.push(`${card} adds ${target.cardModifiers.map(mod => `[${mod}]`).join(' + ')}`);
+    }
+
+    if (target?.personaModifiers?.length) {
+        parts.push(`${personaName()} adds ${target.personaModifiers.map(mod => `[${mod}]`).join(' + ')}`);
     }
 
     return parts.join(', ');
@@ -621,97 +670,134 @@ function relinkName(preset, from, to) {
     }
 
     const fix = (record) => {
-        if (record?.[preset] === from) {
-            if (to) {
-                record[preset] = to;
-            } else {
-                delete record[preset];
-            }
+        if (!record?.[preset]) {
+            return;
+        }
+
+        const stack = readStack(record[preset], data);
+
+        if (!stack) {
+            delete record[preset];
+            return;
+        }
+
+        const set = stack.set === from ? to : stack.set;
+        const modifiers = stack.modifiers.map(mod => (mod === from ? to : mod)).filter(Boolean);
+
+        if (set || modifiers.length) {
+            record[preset] = { set, modifiers };
+        } else {
+            delete record[preset];
         }
     };
 
     Object.values(settings.links).forEach(fix);
     Object.values(settings.cardLinks).forEach(fix);
-    Object.values(settings.personaMods).forEach(fix);
 }
 
-/** Choose where a set (persona, card) or a modifier (stacked for a persona) is used. */
-async function chooseLinks(name) {
-    const data = presetData();
-    const item = data?.sets[name];
+/** A set select plus ordered modifier ticks, for one link. */
+function stackEditor(data, title, stack, noneLabel, onChange) {
+    const state = { set: stack?.set ?? null, modifiers: [...(stack?.modifiers || [])] };
+    const box = element('div', 'ps-stack');
+    box.appendChild(element('h4', null, title));
 
-    if (!item) {
+    const setRow = element('label', 'ps-editor-field');
+    setRow.appendChild(element('span', null, 'Set'));
+    const chains = setNames(data, 'set').map(item => [item, setChain(data, item)]).sort((a, b) => a[1].key.localeCompare(b[1].key));
+    const select = makeSelect([['', noneLabel], ...chains.map(([item, chain]) => [item, chain.label])], state.set ?? '');
+    select.addEventListener('change', () => {
+        state.set = select.value || null;
+        onChange();
+    });
+    setRow.appendChild(select);
+    box.appendChild(setRow);
+
+    const mods = setNames(data, 'modifier').sort((a, b) => modifierChain(data, a).key.localeCompare(modifierChain(data, b).key));
+
+    if (mods.length) {
+        const modRow = element('div', 'ps-editor-field');
+        modRow.appendChild(element('span', null, 'Then add'));
+        const chips = element('div', 'ps-chips');
+
+        const draw = () => {
+            chips.innerHTML = '';
+
+            for (const mod of mods) {
+                const chip = element('label', 'checkbox_label ps-chip');
+                const tick = element('input');
+                tick.type = 'checkbox';
+                tick.checked = state.modifiers.includes(mod);
+                tick.addEventListener('change', () => {
+                    state.modifiers = tick.checked ? [...state.modifiers.filter(item => item !== mod), mod] : state.modifiers.filter(item => item !== mod);
+                    draw();
+                    onChange();
+                });
+                const place = state.modifiers.indexOf(mod);
+                chip.append(tick, element('span', null, place === -1 ? `[${mod}]` : `${place + 1}. [${mod}]`));
+                chips.appendChild(chip);
+            }
+        };
+
+        draw();
+        modRow.appendChild(chips);
+        box.appendChild(modRow);
+    }
+
+    return { element: box, value: () => ({ set: state.set, modifiers: [...state.modifiers] }) };
+}
+
+/** Choose the stack for this card and the stack for this persona, with a preview of the result. */
+async function chooseLinks() {
+    const data = presetData();
+
+    if (!data || !isReady()) {
+        toastr.warning('Load a Chat Completion preset first.', 'Preset Sets');
         return;
     }
 
     const card = currentCard();
-    const content = document.createElement('div');
-    content.classList.add('ps-links');
+    const content = element('div', 'ps-links');
+    content.appendChild(element('h3', null, 'Links for this chat'));
 
-    const heading = document.createElement('h3');
-    heading.textContent = item.kind === 'set' ? `Use "${name}" for` : `Stack [${name}] for`;
-    content.appendChild(heading);
+    const preview = element('div', 'ps-status');
+    const update = () => {
+        const personaStack = readStack(personaEditor.value(), data);
+        const cardStack = card ? readStack(cardEditor.value(), data) : null;
+        const set = personaStack?.set ?? cardStack?.set ?? (data.sets[data.defaultSet]?.kind === 'set' ? data.defaultSet : null);
+        const modifiers = [...new Set([...(cardStack?.modifiers || []), ...(personaStack?.modifiers || [])])];
+        preview.textContent = set || modifiers.length
+            ? `Here you get: ${targetLabel({ name: set, modifiers })}`
+            : 'Here you get the preset\'s own toggles.';
+    };
 
-    const choices = item.kind === 'set'
-        ? [
-            ['persona', `${personaName()}, with any card`],
-            ['card', card ? `${card.name}, for any persona without a set of its own` : 'a character card (open a chat first)'],
-        ]
-        : [
-            ['personaMod', `${personaName()}, on top of whatever set applies`],
-        ];
+    let cardEditor = null;
 
-    const boxes = {};
-
-    for (const [kind, label] of choices) {
-        const row = document.createElement('label');
-        row.classList.add('checkbox_label');
-
-        const box = document.createElement('input');
-        box.type = 'checkbox';
-        const current = getLink(kind);
-        box.checked = current === name;
-        box.disabled = kind === 'card' && !card;
-
-        const text = document.createElement('span');
-        text.textContent = label;
-        row.append(box, text);
-
-        if (current && current !== name) {
-            const now = document.createElement('span');
-            now.classList.add('opacity50p');
-            now.textContent = kind === 'personaMod' ? ` (now [${current}])` : ` (now "${current}")`;
-            row.appendChild(now);
-        }
-
-        boxes[kind] = { box, current };
-        content.appendChild(row);
+    if (card) {
+        cardEditor = stackEditor(data, `Card: ${card.name}`, getStack('card'), '— None: use the persona\'s set or the fallback —', () => update());
+        content.appendChild(cardEditor.element);
+    } else {
+        content.appendChild(element('div', 'opacity50p', 'Open a chat to link its character card.'));
     }
 
-    const hint = document.createElement('div');
-    hint.classList.add('opacity50p');
-    hint.textContent = 'The set comes from the persona\'s link, then the card\'s, then the set for anything without a link. The persona\'s modifier goes on top of it.';
-    content.appendChild(hint);
+    const personaEditor = stackEditor(data, `Persona: ${personaName()}`, getStack('persona'), '— None: use the card\'s set —', () => update());
+    content.appendChild(personaEditor.element);
+    content.appendChild(element('div', 'opacity50p', 'The set comes from the persona if it has one, otherwise the card, otherwise the set for anything without a link. Then the card\'s modifiers are added, then the persona\'s.'));
+    content.appendChild(preview);
+    update();
 
-    const result = await callGenericPopup(content, POPUP_TYPE.CONFIRM, '', { okButton: 'Save', cancelButton: 'Cancel' });
+    const preset = currentPresetName();
+    const result = await callGenericPopup(content, POPUP_TYPE.CONFIRM, '', { okButton: 'Save', cancelButton: 'Cancel', wide: true });
 
-    if (result !== POPUP_RESULT.AFFIRMATIVE) {
+    if (result !== POPUP_RESULT.AFFIRMATIVE || currentPresetName() !== preset) {
         return;
     }
 
-    for (const [kind, { box, current }] of Object.entries(boxes)) {
-        if (box.disabled) {
-            continue;
-        }
-
-        if (box.checked) {
-            setLink(kind, name);
-        } else if (current === name) {
-            setLink(kind, null);
-        }
+    if (cardEditor) {
+        setStack('card', cardEditor.value());
     }
 
-    refreshUI(name);
+    setStack('persona', personaEditor.value());
+    refreshUI();
     await autoApply();
 }
 
@@ -752,7 +838,7 @@ async function applyTarget(target, automatic) {
         return null;
     }
 
-    lastApplied = { preset, name: target.name, modifier: target.modifier || null, source: target.source, missing: [] };
+    lastApplied = { preset, name: target.name, modifiers: [...(target.modifiers || [])], cardModifiers: target.cardModifiers || [], personaModifiers: target.personaModifiers || [], source: target.source, missing: [] };
     const result = await applyIds(ids);
 
     // The preset was switched while saving: the result belongs to the old one, so don't report it.
@@ -777,7 +863,7 @@ async function autoApply() {
     return serial(async () => {
         const target = targetFor();
 
-        if (!target?.name && !target?.modifier) {
+        if (!target?.name && !target?.modifiers?.length) {
             refreshUI();
             return null;
         }
@@ -808,7 +894,7 @@ async function applyNamed(name) {
     }
 
     return serial(async () => {
-        const result = await applyTarget({ name, modifier: null, source: 'manual' }, false);
+        const result = await applyTarget({ name, modifiers: [], source: 'manual' }, false);
         refreshUI();
         return result;
     });
@@ -821,8 +907,10 @@ function keptTarget(data = presetData()) {
     }
 
     const name = data?.sets[lastApplied.name]?.kind === 'set' ? lastApplied.name : null;
-    const modifier = data?.sets[lastApplied.modifier]?.kind === 'modifier' ? lastApplied.modifier : null;
-    return name || modifier ? { name, modifier, source: lastApplied.source } : null;
+    const modifiers = (lastApplied.modifiers || []).filter(mod => data?.sets[mod]?.kind === 'modifier');
+    return name || modifiers.length
+        ? { name, modifiers, cardModifiers: lastApplied.cardModifiers || [], personaModifiers: lastApplied.personaModifiers || [], source: lastApplied.source }
+        : null;
 }
 
 /**
@@ -838,9 +926,9 @@ async function reapplyInUse() {
     // With automatic applying on, what's linked now wins (a set applied by hand lasts only until
     // the next automatic apply anyway); otherwise keep what was applied last.
     const linked = getSettings().autoApply ? targetFor() : null;
-    const target = linked?.name || linked?.modifier ? linked : keptTarget();
+    const target = linked?.name || linked?.modifiers?.length ? linked : keptTarget();
 
-    if (target?.name || target?.modifier) {
+    if (target?.name || target?.modifiers?.length) {
         await serial(() => applyTarget(target, true));
     }
 
@@ -1009,7 +1097,6 @@ function onPresetRenamed({ apiId, oldName, newName } = {}) {
 
     Object.values(settings.links).forEach(move);
     Object.values(settings.cardLinks).forEach(move);
-    Object.values(settings.personaMods).forEach(move);
 
     if (lastApplied?.preset === oldName) {
         lastApplied.preset = newName;
@@ -1123,8 +1210,10 @@ async function renameSelected(name) {
         lastApplied.name = next;
     }
 
-    if (lastApplied?.modifier === name) {
-        lastApplied.modifier = next;
+    if (lastApplied) {
+        for (const key of ['modifiers', 'cardModifiers', 'personaModifiers']) {
+            lastApplied[key] = (lastApplied[key] || []).map(mod => (mod === name ? next : mod));
+        }
     }
 
     saveSettingsDebounced();
@@ -1159,7 +1248,7 @@ async function deleteSelected(name) {
     removeKeeping(data.sets, name, rulesFor(data), [...orderIds()]);
     relinkName(preset, name, null);
 
-    if (lastApplied?.name === name || lastApplied?.modifier === name) {
+    if (lastApplied?.name === name || lastApplied?.modifiers?.includes(name)) {
         lastApplied = null;
     }
 
@@ -1218,7 +1307,7 @@ async function deleteSeveral() {
         }
     }
 
-    if (picked.includes(lastApplied?.name) || picked.includes(lastApplied?.modifier)) {
+    if (picked.includes(lastApplied?.name) || (lastApplied?.modifiers || []).some(mod => picked.includes(mod))) {
         lastApplied = null;
     }
 
@@ -2020,23 +2109,21 @@ function exportSets() {
     }
 
     const settings = getSettings();
-    const links = { persona: {}, card: {}, personaModifier: {} };
+    const links = { persona: {}, card: {} };
 
     for (const [avatar, byPreset] of Object.entries(settings.links)) {
-        if (byPreset?.[preset]) {
-            links.persona[avatar] = byPreset[preset];
+        const stack = readStack(byPreset?.[preset], data);
+
+        if (stack) {
+            links.persona[avatar] = stack;
         }
     }
 
     for (const [card, byPreset] of Object.entries(settings.cardLinks)) {
-        if (byPreset?.[preset]) {
-            links.card[card] = byPreset[preset];
-        }
-    }
+        const stack = readStack(byPreset?.[preset], data);
 
-    for (const [avatar, byPreset] of Object.entries(settings.personaMods)) {
-        if (byPreset?.[preset]) {
-            links.personaModifier[avatar] = byPreset[preset];
+        if (stack) {
+            links.card[card] = stack;
         }
     }
 
@@ -2123,28 +2210,43 @@ async function importSets(file) {
         data.known = payload.known.filter(id => typeof id === 'string');
     }
 
-    const usable = (name) => typeof name === 'string' && data.sets[name]?.kind === 'set';
+    // Links are stacks from version 3; before that they named one set (or, in 2.0, a persona
+    // modifier kept separately). Only parts that exist in this preset are kept.
     const links = payload.links || {};
+    const usableStack = (raw) => {
+        const stack = readStack(raw, data);
 
-    // Version 1 files held persona links directly: { avatar: setName }.
-    const personaLinks = payload.version >= 2 ? links.persona : links;
+        if (!stack) {
+            return null;
+        }
 
-    for (const [avatar, name] of Object.entries(personaLinks || {})) {
-        if (usable(name)) {
-            setLink('persona', name, preset, avatar, null);
+        const set = data.sets[stack.set]?.kind === 'set' ? stack.set : null;
+        const modifiers = stack.modifiers.filter(mod => data.sets[mod]?.kind === 'modifier');
+        return set || modifiers.length ? { set, modifiers } : null;
+    };
+
+    const personaLinks = (payload.version ?? 1) >= 2 ? (links.persona || {}) : links;
+    const personaStacks = new Map(Object.entries(personaLinks).map(([avatar, raw]) => [avatar, usableStack(raw)]));
+
+    for (const [avatar, mod] of Object.entries(links.personaModifier || {})) {
+        if (data.sets[mod]?.kind === 'modifier') {
+            const now = personaStacks.get(avatar) || { set: null, modifiers: [] };
+            personaStacks.set(avatar, { set: now.set, modifiers: [...new Set([...now.modifiers, mod])] });
         }
     }
 
-    if (payload.version >= 2) {
-        for (const [card, name] of Object.entries(links.card || {})) {
-            if (usable(name)) {
-                setLink('card', name, preset, null, card);
-            }
+    for (const [avatar, stack] of personaStacks) {
+        if (stack) {
+            setStack('persona', stack, preset, avatar, null);
         }
+    }
 
-        for (const [avatar, name] of Object.entries(links.personaModifier || {})) {
-            if (typeof name === 'string' && data.sets[name]?.kind === 'modifier') {
-                setLink('personaMod', name, preset, avatar, null);
+    if ((payload.version ?? 1) >= 2) {
+        for (const [card, raw] of Object.entries(links.card || {})) {
+            const stack = usableStack(raw);
+
+            if (stack) {
+                setStack('card', stack, preset, null, card);
             }
         }
     }
@@ -2170,7 +2272,7 @@ async function importSets(file) {
 // ---------------------------------------------------------------------------------------------
 
 /** Fill a select with sets, and optionally modifiers in their own group. */
-function fillSetSelect(select, data, value, { emptyLabel, withModifiers = false, mark = null, markMod = null } = {}) {
+function fillSetSelect(select, data, value, { emptyLabel, withModifiers = false, mark = null, markMods = [] } = {}) {
     select.innerHTML = '';
 
     const add = (parent, optionValue, label) => {
@@ -2194,7 +2296,7 @@ function fillSetSelect(select, data, value, { emptyLabel, withModifiers = false,
     const label = ({ name, chain }) => `${name === mark ? '● ' : ''}${chain.label}`;
     const modLabel = (name) => {
         const users = directDependants(data.sets, name).length;
-        return `${name === markMod ? '● ' : ''}${modifierChain(data, name).label}${users ? ` · used by ${users}` : ''}`;
+        return `${markMods.includes(name) ? '● ' : ''}${modifierChain(data, name).label}${users ? ` · used by ${users}` : ''}`;
     };
 
     if (mods.length) {
@@ -2217,23 +2319,6 @@ function fillSetSelect(select, data, value, { emptyLabel, withModifiers = false,
 
     select.value = all.includes(value) ? value : (emptyLabel !== undefined ? '' : (all[0] ?? ''));
     select.title = select.selectedOptions[0]?.textContent || '';
-}
-
-/** Fill a select with the preset's modifiers, for the persona modifier link. */
-function fillModifierSelect(select, data, value) {
-    select.innerHTML = '';
-    const names = setNames(data, 'modifier').sort((a, b) => modifierChain(data, a).key.localeCompare(modifierChain(data, b).key));
-    const none = element('option', null, names.length ? '— No modifier —' : '— No modifiers in this preset —');
-    none.value = '';
-    select.appendChild(none);
-
-    for (const name of names) {
-        const option = element('option', null, modifierChain(data, name).label);
-        option.value = name;
-        select.appendChild(option);
-    }
-
-    select.value = names.includes(value) ? value : '';
 }
 
 /**
@@ -2297,7 +2382,7 @@ function describeState() {
         parts.push(`Linked to ${target.broken.map(name => `"${name}"`).join(', ')}, which no longer exist${target.broken.length === 1 ? 's' : ''}.`);
     }
 
-    if (!target?.name && !target?.modifier) {
+    if (!target?.name && !target?.modifiers?.length) {
         parts.push('No set applies here, so the preset\'s own toggles are in use.');
     } else {
         const pending = planApply(targetIds(target) || []).changes.length;
@@ -2335,12 +2420,9 @@ function refreshPanel(selectName) {
     const setSelect = /** @type {HTMLSelectElement} */ (document.getElementById('ps_set'));
 
     fillSetSelect(setSelect, data, selectName ?? setSelect.value, { withModifiers: true });
-    fillSetSelect(document.getElementById('ps_link'), data, getLink('persona'), { emptyLabel: '— No link —' });
-    fillSetSelect(document.getElementById('ps_card_link'), data, getLink('card'), { emptyLabel: card ? '— No link —' : '— Open a chat first —' });
-    fillModifierSelect(document.getElementById('ps_persona_mod'), data, getLink('personaMod'));
     fillSetSelect(document.getElementById('ps_default'), data, data?.defaultSet ?? '', { emptyLabel: '— None: keep the preset\'s toggles —' });
-
-    document.getElementById('ps_card_link').toggleAttribute('disabled', !card);
+    document.getElementById('ps_card_stack').textContent = card ? stackLabel(getStack('card')) : 'no chat open';
+    document.getElementById('ps_persona_stack').textContent = stackLabel(getStack('persona'));
     document.getElementById('ps_preset_name').textContent = preset || 'none';
     document.querySelectorAll('.ps_persona_name').forEach(node => { node.textContent = personaName(); });
     document.querySelectorAll('.ps_card_name').forEach(node => { node.textContent = card?.name || 'this card'; });
@@ -2384,15 +2466,16 @@ function addSettingsPanel() {
                     <div id="ps_delete" class="menu_button redWarningBG">Delete</div>
                     <div id="ps_delete_many" class="menu_button redWarningBG" title="Tick several sets and modifiers to delete at once">Delete several…</div>
                 </div>
-                <label for="ps_link">Set for <b class="ps_persona_name"></b></label>
-                <select id="ps_link" class="text_pole"></select>
-                <label for="ps_card_link">Set for <b class="ps_card_name"></b></label>
-                <select id="ps_card_link" class="text_pole"></select>
-                <label for="ps_persona_mod">Modifier for <b class="ps_persona_name"></b>, stacked on top</label>
-                <select id="ps_persona_mod" class="text_pole"></select>
+                <div class="ps-link-summary">
+                    <div>Card <b class="ps_card_name"></b>: <span id="ps_card_stack"></span></div>
+                    <div>Persona <b class="ps_persona_name"></b>: <span id="ps_persona_stack"></span></div>
+                </div>
+                <div class="ps-buttons">
+                    <div id="ps_links" class="menu_button" title="Choose the stack for this card and for this persona">Edit links…</div>
+                </div>
                 <label for="ps_default">Set for anything without a link</label>
                 <select id="ps_default" class="text_pole"></select>
-                <div class="opacity50p">The persona's set wins over the card's. The persona's modifier goes on top of whichever set applies.</div>
+                <div class="opacity50p">The set comes from the persona if it has one, otherwise the card, otherwise this one. Then the card's modifiers are added, then the persona's.</div>
                 <label class="checkbox_label marginTop10" for="ps_lock" title="Prompts can only be switched through sets, and the preset can't be updated, renamed or deleted">
                     <input id="ps_lock" type="checkbox">
                     <span>Lock this preset</span>
@@ -2446,15 +2529,7 @@ function addSettingsPanel() {
         }
     });
 
-    const linkSelect = (id, kind) => $(id).on('change', async event => {
-        setLink(kind, /** @type {HTMLSelectElement} */ (event.target).value || null);
-        refreshUI();
-        await autoApply();
-    });
-
-    linkSelect('#ps_link', 'persona');
-    linkSelect('#ps_card_link', 'card');
-    linkSelect('#ps_persona_mod', 'personaMod');
+    $('#ps_links').on('click', () => chooseLinks());
 
     $('#ps_default').on('change', async event => {
         const data = presetData(currentPresetName(), true);
@@ -2501,7 +2576,7 @@ function shortStatus(target) {
 
     const parts = [];
 
-    if (!target?.name && !target?.modifier) {
+    if (!target?.name && !target?.modifiers?.length) {
         parts.push(target?.broken?.length
             ? `Linked set "${target.broken[0]}" no longer exists. The preset's own toggles are in use`
             : 'No set applies here. The preset\'s own toggles are in use');
@@ -2533,27 +2608,24 @@ function refreshBar(selectName) {
     const data = presetData();
     const target = isReady() ? targetFor() : null;
     const card = currentCard();
-    const context = `${preset}\u0000${user_avatar}\u0000${card?.key ?? ''}\u0000${target?.name ?? ''}\u0000${target?.modifier ?? ''}`;
+    const context = `${preset}\u0000${user_avatar}\u0000${card?.key ?? ''}\u0000${target?.name ?? ''}\u0000${(target?.modifiers || []).join(',')}`;
 
     // Keep the user's choice while they work; show the active set again when the preset, persona,
     // card or active set changes.
     const wanted = selectName ?? (context !== barContext ? target?.name : select.value);
     barContext = context;
 
-    fillSetSelect(select, data, wanted, { withModifiers: true, mark: target?.name, markMod: target?.modifier });
+    fillSetSelect(select, data, wanted, { withModifiers: true, mark: target?.name, markMods: target?.modifiers || [] });
 
     const chosen = select.value;
     const isSet = data?.sets[chosen]?.kind === 'set';
-    const isMod = data?.sets[chosen]?.kind === 'modifier';
-    const linkedHere = (isSet && ['persona', 'card'].some(kind => getLink(kind) === chosen)) || (isMod && getLink('personaMod') === chosen);
+    const linkedHere = Boolean(getStack('persona') || (card && getStack('card')));
     const link = document.getElementById('ps_bar_link');
     link.classList.toggle('ps-on', linkedHere);
-    link.title = isMod
-        ? `Stack [${chosen}] for ${personaName()}, on top of whatever set applies`
-        : `Choose where "${chosen || 'this set'}" is used: this persona, or this card`;
+    link.title = 'Links for this chat: the stack for this card and for this persona';
 
     document.getElementById('ps_bar_edit').classList.toggle('disabled', !chosen);
-    document.getElementById('ps_bar_link').classList.toggle('disabled', !isSet && !isMod);
+    document.getElementById('ps_bar_link').classList.toggle('disabled', !isReady());
 
     for (const id of ['ps_bar_apply', 'ps_bar_update']) {
         document.getElementById(id).classList.toggle('disabled', !isSet);
@@ -2627,7 +2699,7 @@ function addPresetBar() {
     $('#ps_bar_edit').on('click', () => chosen() && editSet(chosen()));
     $('#ps_bar_update').on('click', () => chosen() && updateSelected(chosen()));
     $('#ps_bar_new').on('click', () => editSet(null));
-    $('#ps_bar_link').on('click', () => chosen() && chooseLinks(chosen()));
+    $('#ps_bar_link').on('click', () => chooseLinks());
     $('#ps_bar_lock').on('click', () => currentPresetName() && setLocked(!isLocked()));
 
     // Capture phase, so the prompt manager (or NemoPresetExt's version of it) can't swallow the event.
@@ -2728,7 +2800,6 @@ function onPersonaDeleted(payload) {
 
     if (avatar) {
         delete settings.links[avatar];
-        delete settings.personaMods[avatar];
         saveSettingsDebounced();
     }
 

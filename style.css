@@ -260,3 +260,23 @@
 .ps-editor-ref {
     flex: 1 1 260px;
 }
+
+.ps-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+}
+
+.ps-stack h4 {
+    margin: 0;
+}
+
+.ps-link-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 6px;
+}

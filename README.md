@@ -63,8 +63,8 @@ buttons are:
 - ⟳ **Update**: make the set switch on exactly the prompts that are on now. Hidden while the
   preset is locked.
 - \+ **New**: make a new set or modifier.
-- 🔗 **Link**: choose where the set or modifier is used (see below). It lights up when it's
-  linked for the current persona or card.
+- 🔗 **Links**: choose the stack for this chat's card and for this persona (see below). It lights
+  up when either has a link.
 - 🔒 **Lock**: lock or unlock the preset (see below).
 
 The line underneath says which set applies, why, and whether the toggles match it.
@@ -102,26 +102,27 @@ editor lists the sets a change will also reach.
 
 ## Links
 
-What applies is a set, plus the persona's modifier on top of it.
+Each chat's card and each persona can be linked to a **stack**: a set, then any modifiers in order.
+What applies is built from both:
 
-The set comes from the first of these that has one:
+1. **the set**: the persona's, if its stack has one; otherwise the card's; otherwise the **Set for
+   anything without a link** (or the preset's own toggles if there is none);
+2. **then the card's modifiers**, in order;
+3. **then the persona's modifiers**, in order.
 
-1. the **persona**'s set, wherever it's used;
-2. the **character card**'s set (or the group chat's), for any persona without a set of its own;
-3. the **Set for anything without a link**, if there is one.
+So the card brings the world and the persona brings itself. Link a fantasy card to
+`Base + [Fantasy]` and a persona to `[Wren]`, and that chat gets `Base + [Fantasy] + [Wren]`. Open a
+modern card linked to `Base + [Modern]` with the same persona, and you get `Base + [Modern] + [Wren]`,
+with no named set for either combination. Named sets are still there for anything you'd rather
+pin as one piece. Links to sets or modifiers that no longer exist are skipped.
 
-A persona can also have a **modifier**, stacked on top of whichever set applies. That way a
-persona brings its own changes to every world: with a card linked to `Fantasy` and a persona
-modifier `[Wren]`, you get `Fantasy + [Wren]`; open a chat whose card is linked to `Modern`
-instead, and you get `Modern + [Wren]`. If no set applies, the modifier goes on top of the
-preset's own toggles. Links to sets or modifiers that no longer exist are skipped.
+Press 🔗 on the bar (or **Edit links…** in the Extensions panel) to set both stacks for the chat
+that's open; it shows what you'll get before you save. Applying a set by hand with ✓ applies just
+that set, without any modifiers from links, and lasts until the next automatic apply: a persona
+or chat change, a preset switch, or the next message.
 
-Link from the bar: choose a set or modifier and press 🔗. Or use the selects in the Extensions
-panel. Applying a set by hand with ✓ applies just that set, without the persona's modifier, and lasts
-until the next automatic apply: a persona or chat change, a preset switch, or the next message.
-
-With **Apply the linked set automatically** on, the linked set and modifier are applied when you
-change persona, open a chat, switch preset, and again just before each generation.
+With **Apply the linked set automatically** on, links are applied when you change persona, open a
+chat, switch preset, and again just before each generation.
 
 ## Locking a preset
 
